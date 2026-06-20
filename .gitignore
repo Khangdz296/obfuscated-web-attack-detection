@@ -1,0 +1,12 @@
+# CNN-LSTM trained artifacts and generated analysis outputs
+cnn_lstm/artifacts/
+
+# Python cache/build files
+__pycache__/
+cnn_lstm/__pycache__/
+webapp/__pycache__/
+
+
+
+# OS/editor noise
+.vscode/

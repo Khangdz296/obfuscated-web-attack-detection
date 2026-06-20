@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CNN-LSTM Web Attack Detector</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="panel input-panel">
+        <div class="heading">
+          <p class="eyebrow">Hybrid 1D-CNN + LSTM</p>
+          <h1>Web Attack Detector</h1>
+          <p class="subhead">
+            Nhập request, URL, payload hoặc chuỗi bất kỳ để model phân loại Normal/Attack.
+          </p>
+        </div>
+
+        <form id="predict-form" class="predict-form">
+          <label for="payload">Input cần kiểm tra</label>
+          <textarea
+            id="payload"
+            name="payload"
+            spellcheck="false"
+            placeholder="Ví dụ: /search?q=' OR 1=1 --"
+            required
+          ></textarea>
+
+          <div class="controls">
+            <label class="threshold-control" for="threshold">
+              Threshold
+              <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.5" />
+            </label>
+            <button id="submit-button" type="submit">Phân loại</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel result-panel" aria-live="polite">
+        <div class="result-card empty" id="result-card">
+          <p class="result-label">Chưa có kết quả</p>
+          <p class="result-main">Gửi input để backend chạy qua tokenizer và model.</p>
+        </div>
+
+        <div class="metrics">
+          <div>
+            <span>Attack probability</span>
+            <strong id="attack-prob">-</strong>
+          </div>
+          <div>
+            <span>Normal probability</span>
+            <strong id="normal-prob">-</strong>
+          </div>
+          <div>
+            <span>Input length</span>
+            <strong id="input-length">-</strong>
+          </div>
+        </div>
+
+        <div class="details">
+          <h2>Payload sau tiền xử lý</h2>
+          <pre id="normalized-payload">-</pre>
+        </div>
+
+        <p class="error-message" id="error-message"></p>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
