@@ -1,0 +1,9 @@
+# Generated Python files
+__pycache__/
+*.py[cod]
+
+# Locally generated model artifacts
+**/artifacts*/
+
+*.csv
+*.xlsx
