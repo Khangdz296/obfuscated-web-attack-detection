@@ -39,21 +39,12 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.preprocessing.text import Tokenizer
 
 
-<<<<<<< HEAD
 MODEL_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MODEL_DIR.parent
 KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
 CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
 OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
 OUTPUT_DIR = str(MODEL_DIR / "artifacts")
-=======
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
-KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
-CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
-OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
-OUTPUT_DIR = str(BASE_DIR / "artifacts")
->>>>>>> origin/main
 MAX_LEN = 1024
 EMBEDDING_DIM = 64
 SEED = 42
