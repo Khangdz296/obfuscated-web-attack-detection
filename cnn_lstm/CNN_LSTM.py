@@ -15,9 +15,7 @@ import argparse
 import json
 import pickle
 import random
-import re
-import zipfile
-import xml.etree.ElementTree as ET
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +39,11 @@ from tensorflow.keras.preprocessing.text import Tokenizer
 
 MODEL_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MODEL_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from preprocessing import preprocess_data as prep
+
 KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
 CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
 OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
@@ -57,153 +60,43 @@ def set_seed(seed: int) -> None:
 
 
 def normalize_payload(value: object) -> str:
-    """Keep the payload evidence intact; only normalize redundant whitespace."""
-    if not isinstance(value, str):
-        return ""
-    return re.sub(r"\s+", " ", value).strip()
+    return prep.normalize_payload(value)
 
 
 def to_binary_label(series: pd.Series) -> pd.Series:
-    """Convert labels from multiple datasets to 0=Normal, 1=Attack."""
-    text = series.astype(str).str.strip().str.lower()
-    attack_values = {"1", "true", "attack", "attacks", "malicious", "sqli", "sql", "xss"}
-    normal_values = {"0", "false", "normal", "benign", "clean"}
-
-    labels = []
-    for value in text:
-        if value in attack_values:
-            labels.append(1)
-        elif value in normal_values:
-            labels.append(0)
-        else:
-            numeric = pd.to_numeric(value, errors="coerce")
-            labels.append(1 if pd.notna(numeric) and numeric > 0 else 0)
-    return pd.Series(labels, index=series.index, dtype="int64")
+    return prep.to_binary_label(series)
 
 
 def load_kaggle_dataset(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    required_columns = {"Sentence", "SQLInjection", "XSS"}
-    missing = required_columns - set(df.columns)
-    if missing:
-        raise ValueError(f"{path} is missing columns: {sorted(missing)}")
-
-    out = pd.DataFrame()
-    out["payload"] = df["Sentence"]
-    out["label"] = df[["SQLInjection", "XSS"]].max(axis=1).astype(int)
-    out["source"] = "kaggle_sqli_xss"
-    out["attack_type"] = "mixed"
-    out["obfuscation_type"] = "original"
-    out["pattern_category"] = ""
-    out["difficulty_level"] = ""
-    return out
+    return prep.load_kaggle(path)
 
 
 def load_csic_dataset(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    required_columns = {"content", "URL", "classification"}
-    missing = required_columns - set(df.columns)
-    if missing:
-        raise ValueError(f"{path} is missing columns: {sorted(missing)}")
-
-    out = pd.DataFrame()
-    out["payload"] = df["content"].fillna("") + " " + df["URL"].fillna("")
-    out["label"] = to_binary_label(df["classification"])
-    out["source"] = "csic_2010"
-    out["attack_type"] = "mixed"
-    out["obfuscation_type"] = "original"
-    out["pattern_category"] = ""
-    out["difficulty_level"] = ""
-    return out
+    return prep.load_csic(path)
 
 
 def read_xlsx_first_sheet(path: str) -> pd.DataFrame:
-    """Read a simple first-sheet XLSX table without requiring openpyxl."""
-    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-
-    with zipfile.ZipFile(path) as workbook:
-        shared_strings = []
-        if "xl/sharedStrings.xml" in workbook.namelist():
-            root = ET.fromstring(workbook.read("xl/sharedStrings.xml"))
-            for item in root.findall(namespace + "si"):
-                shared_strings.append("".join(t.text or "" for t in item.iter(namespace + "t")))
-
-        sheet_root = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
-        rows = []
-        for row in sheet_root.find(namespace + "sheetData").findall(namespace + "row"):
-            values = []
-            for cell in row.findall(namespace + "c"):
-                value_node = cell.find(namespace + "v")
-                value = "" if value_node is None else value_node.text or ""
-                if cell.get("t") == "s" and value:
-                    value = shared_strings[int(value)]
-                values.append(value)
-            rows.append(values)
-
-    if not rows:
-        return pd.DataFrame()
-
-    width = max(len(row) for row in rows)
-    rows = [row + [""] * (width - len(row)) for row in rows]
-    return pd.DataFrame(rows[1:], columns=rows[0])
+    return prep.read_xlsx_first_sheet(path)
 
 
 def load_obfuscation_dataset(path: str) -> pd.DataFrame:
-    df = read_xlsx_first_sheet(path) if path.lower().endswith(".xlsx") else pd.read_csv(path)
-    required_columns = {"obfuscated_input", "label", "obfuscation_type"}
-    missing = required_columns - set(df.columns)
-    if missing:
-        raise ValueError(f"{path} is missing columns: {sorted(missing)}")
-
-    out = pd.DataFrame()
-    out["payload"] = df["obfuscated_input"]
-    out["label"] = to_binary_label(df["label"])
-    out["source"] = "custom_obfuscation"
-    out["attack_type"] = df["label"].astype(str).str.strip().str.lower()
-    out["obfuscation_type"] = df["obfuscation_type"]
-    out["pattern_category"] = df["pattern_category"] if "pattern_category" in df.columns else ""
-    out["difficulty_level"] = df["difficulty_level"] if "difficulty_level" in df.columns else ""
-    if "original_pattern" in df.columns:
-        out["original_pattern"] = df["original_pattern"]
-    return out
+    return prep.load_obfuscation(path)
 
 
-def clean_dataset(df: pd.DataFrame, deduplicate: bool = True) -> pd.DataFrame:
-    cleaned = df.copy()
-    cleaned["payload"] = cleaned["payload"].apply(normalize_payload)
-    cleaned["label"] = to_binary_label(cleaned["label"])
-
-    for column in ["source", "attack_type", "obfuscation_type", "pattern_category", "difficulty_level"]:
-        if column not in cleaned.columns:
-            cleaned[column] = ""
-        cleaned[column] = cleaned[column].fillna("").astype(str)
-
-    cleaned = cleaned[cleaned["payload"].str.len() > 0]
-    if deduplicate:
-        cleaned = cleaned.drop_duplicates(subset=["payload", "label"])
-    return cleaned.reset_index(drop=True)
+def clean_dataset(
+    df: pd.DataFrame,
+    deduplicate: bool = True,
+    drop_label_conflicts: bool = True,
+) -> pd.DataFrame:
+    return prep.clean(
+        df,
+        deduplicate=deduplicate,
+        drop_label_conflicts=drop_label_conflicts,
+    )
 
 
 def summarize(df: pd.DataFrame) -> dict:
-    lengths = df["payload"].str.len()
-    summary = {
-        "rows": int(len(df)),
-        "label_counts": {str(k): int(v) for k, v in df["label"].value_counts().sort_index().items()},
-        "source_counts": {str(k): int(v) for k, v in df["source"].value_counts().items()},
-        "length": {
-            "mean": float(lengths.mean()) if len(df) else 0.0,
-            "median": float(lengths.median()) if len(df) else 0.0,
-            "p90": float(lengths.quantile(0.90)) if len(df) else 0.0,
-            "p95": float(lengths.quantile(0.95)) if len(df) else 0.0,
-            "p99": float(lengths.quantile(0.99)) if len(df) else 0.0,
-            "max": int(lengths.max()) if len(df) else 0,
-        },
-    }
-    if "obfuscation_type" in df.columns:
-        summary["obfuscation_counts_top30"] = {
-            str(k): int(v) for k, v in df["obfuscation_type"].value_counts().head(30).items()
-        }
-    return summary
+    return prep.summarize(df)
 
 
 def build_datasets(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
@@ -214,7 +107,7 @@ def build_datasets(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame
         ],
         ignore_index=True,
     )
-    base_df = clean_dataset(base_df, deduplicate=True)
+    base_df = clean_dataset(base_df, deduplicate=True, drop_label_conflicts=True)
     base_df = base_df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
 
     if args.sample_size:
@@ -234,7 +127,11 @@ def build_datasets(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame
         stratify=train_val_df["label"],
     )
 
-    obfuscated_df = clean_dataset(load_obfuscation_dataset(args.obfuscation_path), deduplicate=True)
+    obfuscated_df = clean_dataset(
+        load_obfuscation_dataset(args.obfuscation_path),
+        deduplicate=True,
+        drop_label_conflicts=False,
+    )
     if args.obfu_sample_size:
         obfuscated_df = obfuscated_df.sample(
             n=min(args.obfu_sample_size, len(obfuscated_df)),
@@ -247,6 +144,9 @@ def build_datasets(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame
             "html_unescape": False,
             "lowercase": False,
             "whitespace_normalization_only": True,
+            "csic_payload_policy": "Use raw query/body parameter values only; drop requests with no input values.",
+            "drop_label_conflicts_base": True,
+            "drop_label_conflicts_obfuscated_test": False,
             "tokenizer_rule": "Tokenizer is fit on train split only.",
         },
         "splits": {

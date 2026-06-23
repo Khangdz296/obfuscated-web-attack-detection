@@ -59,6 +59,41 @@ def load_kaggle(path: str) -> pd.DataFrame:
     return out
 
 
+def extract_form_values(payload: object) -> str:
+    """Extract raw form/query values without URL-decoding obfuscation evidence."""
+    if not isinstance(payload, str):
+        return ""
+
+    values = []
+    for pair in payload.split("&"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" in pair:
+            _, value = pair.split("=", 1)
+        else:
+            value = pair
+        if value:
+            values.append(value)
+    return " ".join(values)
+
+
+def extract_url_query(url: object) -> str:
+    if not isinstance(url, str):
+        return ""
+
+    request_url = re.sub(r"\s+HTTP/\d(?:\.\d)?\s*$", "", url.strip())
+    if "?" not in request_url:
+        return ""
+    return request_url.split("?", 1)[1]
+
+
+def extract_csic_input_values(row: pd.Series) -> str:
+    body_values = extract_form_values(row.get("content", ""))
+    query_values = extract_form_values(extract_url_query(row.get("URL", "")))
+    return " ".join(value for value in [body_values, query_values] if value)
+
+
 def load_csic(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     required = {"content", "URL", "classification"}
@@ -67,7 +102,7 @@ def load_csic(path: str) -> pd.DataFrame:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
 
     out = pd.DataFrame()
-    out["payload"] = df["content"].fillna("") + " " + df["URL"].fillna("")
+    out["payload"] = df.apply(extract_csic_input_values, axis=1)
     out["label"] = to_binary_label(df["classification"])
     out["source"] = "csic_2010"
     out["attack_type"] = "mixed"
@@ -133,7 +168,7 @@ def load_obfuscation(path: str) -> pd.DataFrame:
     return out
 
 
-def clean(df: pd.DataFrame, deduplicate: bool = True) -> pd.DataFrame:
+def clean(df: pd.DataFrame, deduplicate: bool = True, drop_label_conflicts: bool = True) -> pd.DataFrame:
     cleaned = df.copy()
     cleaned["payload"] = cleaned["payload"].apply(normalize_payload)
     cleaned["label"] = to_binary_label(cleaned["label"])
@@ -144,6 +179,9 @@ def clean(df: pd.DataFrame, deduplicate: bool = True) -> pd.DataFrame:
         cleaned[column] = cleaned[column].fillna("").astype(str)
 
     cleaned = cleaned[cleaned["payload"].str.len() > 0]
+    if drop_label_conflicts:
+        label_counts = cleaned.groupby("payload")["label"].transform("nunique")
+        cleaned = cleaned[label_counts == 1]
     if deduplicate:
         cleaned = cleaned.drop_duplicates(subset=["payload", "label"])
     return cleaned.reset_index(drop=True)
@@ -210,7 +248,7 @@ def main() -> None:
         test_size=args.test_size,
         random_state=args.seed,
         stratify=base_df["label"],
-    )
+    ) 
     train_df, val_df = train_test_split(
         train_val_df,
         test_size=args.val_size,
@@ -218,7 +256,7 @@ def main() -> None:
         stratify=train_val_df["label"],
     )
 
-    obfu_df = clean(load_obfuscation(args.obfu_path), deduplicate=True)
+    obfu_df = clean(load_obfuscation(args.obfu_path), deduplicate=True, drop_label_conflicts=False)
 
     save_csv(base_df, output_dir / "base_clean.csv")
     save_csv(train_df, output_dir / "train.csv")

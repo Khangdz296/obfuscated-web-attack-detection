@@ -1,7 +1,8 @@
 # Generated Python files
-__pycache__/
+**/__pycache__/
 *.py[cod]
 .venv/
+myvenv/
 
 # Locally generated model artifacts
 **/artifacts*/
