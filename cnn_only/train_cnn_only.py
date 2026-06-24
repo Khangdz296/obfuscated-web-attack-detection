@@ -1,7 +1,11 @@
-"""CNN-only baseline using exactly the same data pipeline as CNN_LSTM.py."""
+"""CNN-only baseline using the shared preprocessing pipeline.
+
+The data policy is owned by preprocessing/preprocess_data.py. In particular,
+CSIC requests contribute raw query/body values only; URL paths and parameter
+names are not used as model input.
+"""
 
 import argparse
-import importlib.util
 import json
 import pickle
 import sys
@@ -24,27 +28,23 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import Adam
 
-_test_path = Path(__file__).resolve().parent.parent / "cnn_lstm" / "CNN_LSTM.py"
-_spec = importlib.util.spec_from_file_location("nckh_test_pipeline", _test_path)
-_pipeline = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = _pipeline
-_spec.loader.exec_module(_pipeline)
+MODEL_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = MODEL_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-CSIC_PATH = _pipeline.CSIC_PATH
-EMBEDDING_DIM = _pipeline.EMBEDDING_DIM
-KAGGLE_PATH = _pipeline.KAGGLE_PATH
-MAX_LEN = _pipeline.MAX_LEN
-OBFUSCATION_PATH = _pipeline.OBFUSCATION_PATH
-SEED = _pipeline.SEED
-build_datasets = _pipeline.build_datasets
-build_tokenizer = _pipeline.build_tokenizer
-evaluate_model = _pipeline.evaluate_model
-save_processed_csvs = _pipeline.save_processed_csvs
-set_seed = _pipeline.set_seed
-vectorize = _pipeline.vectorize
+from cnn_lstm import CNN_LSTM as pipeline
+from preprocessing import preprocess_data as prep
+
+CSIC_PATH = pipeline.CSIC_PATH
+EMBEDDING_DIM = pipeline.EMBEDDING_DIM
+KAGGLE_PATH = pipeline.KAGGLE_PATH
+MAX_LEN = pipeline.MAX_LEN
+OBFUSCATION_PATH = pipeline.OBFUSCATION_PATH
+SEED = pipeline.SEED
 
 
-OUTPUT_DIR = str(Path(__file__).resolve().parent / "artifacts")
+OUTPUT_DIR = str(MODEL_DIR / "artifacts_new_preprocessing")
 
 
 def build_cnn_model(vocab_size: int, max_len: int, embedding_dim: int) -> Sequential:
@@ -94,19 +94,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    pipeline.set_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_df, val_df, test_df, obfuscated_df, metadata = build_datasets(args)
-    save_processed_csvs(output_dir, train_df, val_df, test_df, obfuscated_df)
+    train_df, val_df, test_df, obfuscated_df, metadata = pipeline.build_datasets(args)
+    pipeline.save_processed_csvs(output_dir, train_df, val_df, test_df, obfuscated_df)
 
-    tokenizer = build_tokenizer(train_df["payload"])
+    tokenizer = pipeline.build_tokenizer(train_df["payload"])
     vocab_size = len(tokenizer.word_index) + 1
-    X_train = vectorize(tokenizer, train_df["payload"], args.max_len)
-    X_val = vectorize(tokenizer, val_df["payload"], args.max_len)
-    X_test = vectorize(tokenizer, test_df["payload"], args.max_len)
-    X_obfu = vectorize(tokenizer, obfuscated_df["payload"], args.max_len)
+    X_train = pipeline.vectorize(tokenizer, train_df["payload"], args.max_len)
+    X_val = pipeline.vectorize(tokenizer, val_df["payload"], args.max_len)
+    X_test = pipeline.vectorize(tokenizer, test_df["payload"], args.max_len)
+    X_obfu = pipeline.vectorize(tokenizer, obfuscated_df["payload"], args.max_len)
     y_train = train_df["label"].to_numpy(dtype=np.int32)
     y_val = val_df["label"].to_numpy(dtype=np.int32)
     y_test = test_df["label"].to_numpy(dtype=np.int32)
@@ -120,6 +120,8 @@ def main() -> None:
     print(f"Train: {len(train_df):,} | Val: {len(val_df):,} | Test: {len(test_df):,}")
     print(f"Obfuscated test: {len(obfuscated_df):,}")
     print(f"X_train: {X_train.shape} | Vocab: {vocab_size}")
+    print("Shared preprocessing:", Path(prep.__file__).resolve())
+    print("CSIC policy:", metadata["preprocessing_policy"]["csic_payload_policy"])
 
     model = build_cnn_model(vocab_size, args.max_len, args.embedding_dim)
     model.summary()
@@ -146,8 +148,12 @@ def main() -> None:
     with (output_dir / "tokenizer.pkl").open("wb") as file:
         pickle.dump(tokenizer, file)
 
-    test_result = evaluate_model(model, X_test, y_test, "CNN-only normal test", args.batch_size)
-    obfu_result = evaluate_model(model, X_obfu, y_obfu, "CNN-only obfuscated test", args.batch_size)
+    test_result = pipeline.evaluate_model(
+        model, X_test, y_test, "CNN-only normal test", args.batch_size
+    )
+    obfu_result = pipeline.evaluate_model(
+        model, X_obfu, y_obfu, "CNN-only obfuscated test", args.batch_size
+    )
     epochs_run = len(history.history["loss"])
 
     metadata["cnn_only_model"] = {
