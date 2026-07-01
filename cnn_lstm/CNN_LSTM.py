@@ -30,7 +30,16 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.layers import Conv1D, Dense, Dropout, Embedding, Input, LSTM, MaxPooling1D
+from tensorflow.keras.layers import (
+    Conv1D,
+    Dense,
+    Dropout,
+    Embedding,
+    GlobalMaxPooling1D,
+    Input,
+    LSTM,
+    MaxPooling1D,
+)
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -182,7 +191,7 @@ def vectorize(tokenizer: Tokenizer, payloads: pd.Series, max_len: int) -> np.nda
 
 
 def build_model(vocab_size: int, max_len: int, embedding_dim: int) -> Sequential:
-    model = Sequential(name="Hybrid_1D_CNN_LSTM_Web_Attack_Detector")
+    model = Sequential(name="Hybrid_1D_CNN_LSTM_Sequence_Pooling_Web_Attack_Detector")
     model.add(Input(shape=(max_len,), name="payload_tokens"))
     model.add(Embedding(input_dim=vocab_size, output_dim=embedding_dim, name="char_embedding"))
 
@@ -192,7 +201,8 @@ def build_model(vocab_size: int, max_len: int, embedding_dim: int) -> Sequential
     model.add(Conv1D(filters=128, kernel_size=5, padding="same", activation="relu", name="conv_k5"))
     model.add(MaxPooling1D(pool_size=4, name="pool_2"))
 
-    model.add(LSTM(128, name="lstm_context"))
+    model.add(LSTM(128, return_sequences=True, name="lstm_context_sequence"))
+    model.add(GlobalMaxPooling1D(name="lstm_global_max_pool"))
     model.add(Dense(64, activation="relu", name="dense_classifier"))
     model.add(Dropout(0.3, name="dropout"))
     model.add(Dense(1, activation="sigmoid", name="attack_probability"))
@@ -358,7 +368,9 @@ def main() -> None:
         "max_len": args.max_len,
         "embedding_dim": args.embedding_dim,
         "vocab_size": vocab_size,
-        "architecture": "Embedding -> Conv1D(k3) -> MaxPool(4) -> Conv1D(k5) -> MaxPool(4) -> LSTM(128) -> Dense -> Sigmoid",
+        "architecture": "Embedding -> Conv1D(k3) -> MaxPool(4) -> Conv1D(k5) -> MaxPool(4) -> LSTM(128, return_sequences=True) -> GlobalMaxPooling1D -> Dense(64) -> Dropout -> Sigmoid",
+        "architecture_note": "Sequence pooling keeps the LSTM output at every timestep and pools the strongest activation, instead of relying only on the final LSTM state.",
+        "parameter_count": int(model.count_params()),
         "class_weight": class_weight_dict,
         "artifacts": {
             "best_model": str(best_model_path),
