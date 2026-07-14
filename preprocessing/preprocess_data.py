@@ -218,6 +218,148 @@ def save_csv(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(path, index=False, encoding="utf-8")
 
 
+def split_dataset(
+    df: pd.DataFrame,
+    test_size: float,
+    val_size: float,
+    seed: int,
+    group_column: str | None = None,
+) -> dict[str, pd.DataFrame]:
+    if not 0 < test_size < 1:
+        raise ValueError("--test-size must be between 0 and 1.")
+    if not 0 < val_size < 1:
+        raise ValueError("--val-size must be between 0 and 1.")
+
+    shuffled = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+    if group_column and group_column in shuffled.columns:
+        return split_dataset_by_group(shuffled, test_size, val_size, seed, group_column)
+    return split_dataset_by_row(shuffled, test_size, val_size, seed)
+
+
+def safe_train_test_split(
+    df: pd.DataFrame,
+    test_size: float,
+    seed: int,
+    stratify_column: str = "label",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    stratify = df[stratify_column] if stratify_column in df.columns else None
+    try:
+        return train_test_split(
+            df,
+            test_size=test_size,
+            random_state=seed,
+            stratify=stratify,
+        )
+    except ValueError:
+        return train_test_split(df, test_size=test_size, random_state=seed)
+
+
+def split_dataset_by_row(
+    df: pd.DataFrame,
+    test_size: float,
+    val_size: float,
+    seed: int,
+) -> dict[str, pd.DataFrame]:
+    train_val_df, test_df = safe_train_test_split(df, test_size, seed)
+    train_df, val_df = safe_train_test_split(train_val_df, val_size, seed)
+    return {
+        "train": train_df.reset_index(drop=True),
+        "val": val_df.reset_index(drop=True),
+        "test": test_df.reset_index(drop=True),
+    }
+
+
+def split_dataset_by_group(
+    df: pd.DataFrame,
+    test_size: float,
+    val_size: float,
+    seed: int,
+    group_column: str,
+) -> dict[str, pd.DataFrame]:
+    group_key = df[group_column].fillna("").astype(str)
+    group_key = group_key.where(group_key.str.len() > 0, df["payload"])
+
+    group_frame = (
+        pd.DataFrame({"group_key": group_key, "label": df["label"]})
+        .groupby("group_key", as_index=False)["label"]
+        .agg(lambda values: values.mode().iloc[0])
+    )
+    train_val_groups, test_groups = safe_train_test_split(group_frame, test_size, seed)
+    train_groups, val_groups = safe_train_test_split(train_val_groups, val_size, seed)
+
+    train_keys = set(train_groups["group_key"])
+    val_keys = set(val_groups["group_key"])
+    test_keys = set(test_groups["group_key"])
+
+    return {
+        "train": df[group_key.isin(train_keys)].reset_index(drop=True),
+        "val": df[group_key.isin(val_keys)].reset_index(drop=True),
+        "test": df[group_key.isin(test_keys)].reset_index(drop=True),
+    }
+
+
+def load_clean_datasets(kaggle_path: str, csic_path: str, obfu_path: str) -> dict[str, pd.DataFrame]:
+    return {
+        "kaggle": clean(load_kaggle(kaggle_path), deduplicate=True, drop_label_conflicts=True),
+        "csic": clean(load_csic(csic_path), deduplicate=True, drop_label_conflicts=True),
+        "obfuscation": clean(
+            load_obfuscation(obfu_path),
+            deduplicate=True,
+            drop_label_conflicts=False,
+        ),
+    }
+
+
+def split_all_datasets(
+    datasets: dict[str, pd.DataFrame],
+    test_size: float,
+    val_size: float,
+    seed: int,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    output = {}
+    for name, frame in datasets.items():
+        group_column = "original_pattern" if name == "obfuscation" else None
+        output[name] = split_dataset(frame, test_size, val_size, seed, group_column=group_column)
+    return output
+
+
+def build_dataset_splits(
+    kaggle_path: str,
+    csic_path: str,
+    obfu_path: str,
+    test_size: float,
+    val_size: float,
+    seed: int,
+) -> tuple[dict[str, dict[str, pd.DataFrame]], dict]:
+    datasets = load_clean_datasets(kaggle_path, csic_path, obfu_path)
+    dataset_splits = split_all_datasets(datasets, test_size, val_size, seed)
+    metadata = {
+        "preprocessing_policy": {
+            "url_decode": False,
+            "html_unescape": False,
+            "lowercase": False,
+            "whitespace_normalization_only": True,
+            "deduplicate_by": ["payload", "label"],
+            "csic_payload_policy": "Use raw query/body parameter values only; drop requests with no input values.",
+            "obfuscation_group_split": "Use original_pattern when available so variants of the same pattern stay in one split.",
+            "tokenizer_rule": "Each model fits its tokenizer on that dataset's train split only.",
+        },
+        "datasets": {},
+    }
+    for name, frame in datasets.items():
+        metadata["datasets"][name] = {
+            "clean": summarize(frame),
+            "splits": {split_name: summarize(split_df) for split_name, split_df in dataset_splits[name].items()},
+        }
+    return dataset_splits, metadata
+
+
+def save_dataset_splits(dataset_splits: dict[str, dict[str, pd.DataFrame]], output_dir: Path) -> None:
+    for dataset_name, splits in dataset_splits.items():
+        for split_name, split_df in splits.items():
+            save_csv(split_df, output_dir / dataset_name / f"{split_name}.csv")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Preprocess datasets for char-level SQLi/XSS detection.")
     parser.add_argument("--kaggle-path", default=KAGGLE_PATH)
@@ -235,66 +377,28 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    base_df = clean(
-        pd.concat(
-            [
-                load_kaggle(args.kaggle_path),
-                load_csic(args.csic_path),
-            ],
-            ignore_index=True,
-        ),
-        deduplicate=True,
+    dataset_splits, metadata = build_dataset_splits(
+        args.kaggle_path,
+        args.csic_path,
+        args.obfu_path,
+        args.test_size,
+        args.val_size,
+        args.seed,
     )
-    base_df = base_df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
-
-    train_val_df, test_df = train_test_split(
-        base_df,
-        test_size=args.test_size,
-        random_state=args.seed,
-        stratify=base_df["label"],
-    ) 
-    train_df, val_df = train_test_split(
-        train_val_df,
-        test_size=args.val_size,
-        random_state=args.seed,
-        stratify=train_val_df["label"],
-    )
-
-    obfu_df = clean(load_obfuscation(args.obfu_path), deduplicate=True, drop_label_conflicts=False)
-
-    save_csv(base_df, output_dir / "base_clean.csv")
-    save_csv(train_df, output_dir / "train.csv")
-    save_csv(val_df, output_dir / "val.csv")
-    save_csv(test_df, output_dir / "test.csv")
-    save_csv(obfu_df, output_dir / "obfuscated_test.csv")
-
-    metadata = {
-        "preprocessing_policy": {
-            "url_decode": False,
-            "html_unescape": False,
-            "lowercase": False,
-            "whitespace_normalization_only": True,
-            "deduplicate_base_by": ["payload", "label"],
-            "tokenizer_rule": "Fit tokenizer on train.csv only. Do not fit on val/test/obfuscated_test.",
-        },
-        "splits": {
-            "base_clean": summarize(base_df),
-            "train": summarize(train_df),
-            "val": summarize(val_df),
-            "test": summarize(test_df),
-            "obfuscated_test": summarize(obfu_df),
-        },
-    }
+    save_dataset_splits(dataset_splits, output_dir)
 
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     print("=== PREPROCESSING DONE ===")
     print(f"Output directory: {output_dir.resolve()}")
-    print(f"Train: {len(train_df):,}")
-    print(f"Val: {len(val_df):,}")
-    print(f"Test: {len(test_df):,}")
-    print(f"Obfuscated test: {len(obfu_df):,}")
+    for dataset_name, splits in dataset_splits.items():
+        print(
+            f"{dataset_name}: "
+            f"train={len(splits['train']):,} | "
+            f"val={len(splits['val']):,} | "
+            f"test={len(splits['test']):,}"
+        )
 
 
 if __name__ == "__main__":
