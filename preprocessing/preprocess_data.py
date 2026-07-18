@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
 CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
-OBFU_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
+OBFU_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full_with_benign_shaped.xlsx")
 OUTPUT_DIR = str(PROJECT_ROOT / "cnn_lstm" / "artifacts" / "processed_data")
 RANDOM_STATE = 42
 
@@ -128,7 +128,11 @@ def read_xlsx_first_sheet(path: str) -> pd.DataFrame:
             values = []
             for cell in row.findall(ns + "c"):
                 value_node = cell.find(ns + "v")
-                value = "" if value_node is None else value_node.text or ""
+                inline_node = cell.find(ns + "is")
+                if cell.get("t") == "inlineStr" and inline_node is not None:
+                    value = "".join(t.text or "" for t in inline_node.iter(ns + "t"))
+                else:
+                    value = "" if value_node is None else value_node.text or ""
                 if cell.get("t") == "s" and value:
                     value = shared_strings[int(value)]
                 values.append(value)

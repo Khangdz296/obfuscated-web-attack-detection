@@ -55,7 +55,7 @@ from preprocessing import preprocess_data as prep
 
 KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
 CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
-OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
+OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full_with_benign_shaped.xlsx")
 OUTPUT_DIR = str(MODEL_DIR / "artifacts")
 MAX_LEN = 1024
 EMBEDDING_DIM = 64

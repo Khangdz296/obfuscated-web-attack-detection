@@ -29,7 +29,8 @@ The workflow has two stages:
 |       +-- styles.css
 +-- SQLInjection_XSS_MixDataset.1.0.0.csv
 +-- csic_database.csv
-+-- obfuscation_dataset_full.xlsx
++-- obfuscation_dataset_full.xlsx                    # original attack-only robustness dataset
++-- obfuscation_dataset_full_with_benign_shaped.xlsx # attack + shaped benign robustness dataset
 ```
 
 ## Requirements
@@ -59,7 +60,7 @@ After downloading, place these files in the repository root:
 ```text
 SQLInjection_XSS_MixDataset.1.0.0.csv
 csic_database.csv
-obfuscation_dataset_full.xlsx
+obfuscation_dataset_full_with_benign_shaped.xlsx
 ```
 
 Run training from the repository root:
@@ -79,7 +80,7 @@ The script will:
 - load and clean the Kaggle SQLi/XSS dataset and CSIC dataset;
 - keep obfuscation evidence by only normalizing redundant whitespace;
 - split the base dataset into train, validation, and test sets;
-- keep the custom obfuscation dataset as a separate robustness test set;
+- keep the custom obfuscation dataset as a separate robustness test set, including both obfuscated attacks and shaped benign payload samples;
 - fit the char-level tokenizer on the train split only;
 - train the Hybrid CNN-LSTM model;
 - evaluate the model on the normal test set and the obfuscated test set.
