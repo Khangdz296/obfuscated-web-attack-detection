@@ -55,11 +55,13 @@ from preprocessing import preprocess_data as prep
 
 KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
 CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
-OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full_with_benign_shaped.xlsx")
+OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset.xlsx")
 OUTPUT_DIR = str(MODEL_DIR / "artifacts")
 MAX_LEN = 1024
 EMBEDDING_DIM = 64
 SEED = 42
+DECISION_THRESHOLD = 0.5
+EARLY_STOPPING_MIN_DELTA = 1e-4
 
 
 def set_seed(seed: int) -> None:
@@ -174,7 +176,7 @@ def build_model(vocab_size: int, max_len: int, embedding_dim: int) -> Sequential
 
 def evaluate_model(model: Sequential, X: np.ndarray, y: np.ndarray, name: str, batch_size: int) -> dict:
     y_prob = model.predict(X, batch_size=batch_size).flatten()
-    y_pred = (y_prob >= 0.5).astype(int)
+    y_pred = (y_prob >= DECISION_THRESHOLD).astype(int)
 
     result = {
         "accuracy": float(accuracy_score(y, y_pred)),
@@ -343,9 +345,24 @@ def train_and_evaluate_source_model(
     best_model_path = source_dir / "best_hybrid_cnn_lstm.keras"
     last_model_path = source_dir / "last_hybrid_cnn_lstm.keras"
     tokenizer_path = source_dir / "tokenizer.pkl"
+    history_path = source_dir / "training_history.csv"
+    config_path = source_dir / "preprocessing_config.json"
     callbacks = [
-        EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True, verbose=1),
-        ModelCheckpoint(filepath=str(best_model_path), monitor="val_loss", save_best_only=True, verbose=1),
+        EarlyStopping(
+            monitor="val_loss",
+            mode="min",
+            min_delta=EARLY_STOPPING_MIN_DELTA,
+            patience=3,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        ModelCheckpoint(
+            filepath=str(best_model_path),
+            monitor="val_loss",
+            mode="min",
+            save_best_only=True,
+            verbose=1,
+        ),
     ]
 
     history = model.fit(
@@ -362,6 +379,9 @@ def train_and_evaluate_source_model(
     model.save(last_model_path)
     with tokenizer_path.open("wb") as file:
         pickle.dump(tokenizer, file)
+    pd.DataFrame(history.history).to_csv(history_path, index=False, encoding="utf-8")
+
+    best_model = tf.keras.models.load_model(best_model_path)
 
     evaluations = {}
     summary_rows = []
@@ -370,7 +390,7 @@ def train_and_evaluate_source_model(
         X_test = vectorize(tokenizer, test_df["payload"], args.max_len)
         y_test = test_df["label"].to_numpy(dtype=np.int32)
         result = evaluate_model(
-            model,
+            best_model,
             X_test,
             y_test,
             f"{train_source} model on {test_source} test",
@@ -379,20 +399,64 @@ def train_and_evaluate_source_model(
         evaluations[test_source] = result
         summary_rows.append(evaluation_summary_row(train_source, test_source, result))
 
+    preprocessing_config = {
+        "dataset": train_source,
+        "seed": args.seed,
+        "preprocessing_source": "preprocessing/preprocess_data.py",
+        "split_target": {"train": 0.72, "validation": 0.08, "test": 0.20},
+        "group_column": "original_pattern" if train_source == "obfuscation" else None,
+        "url_decode": False,
+        "html_unescape": False,
+        "lowercase": False,
+        "whitespace_normalization_only": True,
+        "tokenizer_fit_split": "train",
+        "vocab_size": int(vocab_size),
+        "max_len": int(args.max_len),
+        "padding": "post",
+        "truncating": "post",
+        "decision_threshold": DECISION_THRESHOLD,
+        "class_weight": {str(key): float(value) for key, value in class_weight_dict.items()},
+        "splits": {
+            split_name: prep.summarize(split_df)
+            for split_name, split_df in dataset_splits[train_source].items()
+        },
+    }
+    with config_path.open("w", encoding="utf-8") as file:
+        json.dump(preprocessing_config, file, ensure_ascii=False, indent=2)
+
     model_metadata = {
         "train_source": train_source,
+        "preprocessing": preprocessing_config,
         "model": {
             "max_len": args.max_len,
             "embedding_dim": args.embedding_dim,
             "vocab_size": vocab_size,
             "architecture": "Embedding -> Conv1D(k3) -> MaxPool(4) -> Conv1D(k5) -> MaxPool(4) -> LSTM(128, return_sequences=True) -> GlobalMaxPooling1D -> Dense(64) -> Dropout -> Sigmoid",
             "architecture_note": "One independent model is trained per dataset source, then evaluated on every dataset test split.",
-            "parameter_count": int(model.count_params()),
+            "cnn_filters": [128, 128],
+            "cnn_kernel_sizes": [3, 5],
+            "cnn_pool_sizes": [4, 4],
+            "lstm_units": 128,
+            "lstm_return_sequences": True,
+            "lstm_pooling": "GlobalMaxPooling1D",
+            "dense_units": 64,
+            "dropout": 0.3,
+            "learning_rate": 1e-3,
+            "parameter_count": int(best_model.count_params()),
             "class_weight": class_weight_dict,
+            "epochs_requested": int(args.epochs),
+            "epochs_ran": int(len(history.history["loss"])),
+            "early_stopping_monitor": "val_loss",
+            "early_stopping_mode": "min",
+            "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
+            "early_stopping_patience": 3,
+            "decision_threshold": DECISION_THRESHOLD,
             "artifacts": {
                 "best_model": str(best_model_path),
                 "last_model": str(last_model_path),
                 "tokenizer": str(tokenizer_path),
+                "training_history": str(history_path),
+                "preprocessing_config": str(config_path),
             },
         },
         "training_history": {
