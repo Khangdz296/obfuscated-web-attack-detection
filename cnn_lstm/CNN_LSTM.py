@@ -24,8 +24,10 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     classification_report,
     confusion_matrix,
+    precision_recall_curve,
     roc_auc_score,
 )
 from sklearn.utils.class_weight import compute_class_weight
@@ -55,7 +57,7 @@ from preprocessing import preprocess_data as prep
 
 KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
 CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
-OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset.xlsx")
+OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
 OUTPUT_DIR = str(MODEL_DIR / "artifacts")
 MAX_LEN = 1024
 EMBEDDING_DIM = 64
@@ -107,7 +109,8 @@ def build_datasets(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame
             "html_unescape": False,
             "lowercase": False,
             "whitespace_normalization_only": True,
-            "csic_payload_policy": "Use raw query/body parameter values only; drop requests with no input values.",
+            "input_representation": "Unified HTTP envelope for every source.",
+            "csic_payload_policy": "Keep method, path, query, body, cookie and content type.",
             "drop_label_conflicts_base": True,
             "drop_label_conflicts_obfuscated_test": False,
             "tokenizer_rule": "Tokenizer is fit on train split only.",
@@ -174,18 +177,54 @@ def build_model(vocab_size: int, max_len: int, embedding_dim: int) -> Sequential
     return model
 
 
-def evaluate_model(model: Sequential, X: np.ndarray, y: np.ndarray, name: str, batch_size: int) -> dict:
+def choose_validation_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
+    """Choose an F1-optimal threshold using validation data only."""
+    precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
+    if not len(thresholds):
+        return {
+            "threshold": DECISION_THRESHOLD,
+            "precision": float(precision[0]),
+            "recall": float(recall[0]),
+            "f1": 0.0,
+        }
+    denominator = precision[:-1] + recall[:-1]
+    f1 = np.divide(
+        2.0 * precision[:-1] * recall[:-1],
+        denominator,
+        out=np.zeros_like(denominator),
+        where=denominator > 0,
+    )
+    best_index = int(np.argmax(f1))
+    return {
+        "threshold": float(thresholds[best_index]),
+        "precision": float(precision[best_index]),
+        "recall": float(recall[best_index]),
+        "f1": float(f1[best_index]),
+    }
+
+
+def evaluate_model(
+    model: Sequential,
+    X: np.ndarray,
+    y: np.ndarray,
+    name: str,
+    batch_size: int,
+    threshold: float,
+) -> dict:
     y_prob = model.predict(X, batch_size=batch_size).flatten()
-    y_pred = (y_prob >= DECISION_THRESHOLD).astype(int)
+    y_pred = (y_prob >= threshold).astype(int)
 
     result = {
         "accuracy": float(accuracy_score(y, y_pred)),
         "auc_roc": float(roc_auc_score(y, y_prob)) if len(np.unique(y)) > 1 else None,
-        "confusion_matrix": confusion_matrix(y, y_pred).tolist(),
+        "pr_auc": float(average_precision_score(y, y_prob)) if len(np.unique(y)) > 1 else None,
+        "decision_threshold": float(threshold),
+        "confusion_matrix": confusion_matrix(y, y_pred, labels=[0, 1]).tolist(),
         "classification_report": classification_report(
             y,
             y_pred,
-            target_names=["Normal (0)", "Attack (1)"] if len(np.unique(y)) > 1 else None,
+            labels=[0, 1],
+            target_names=["Normal (0)", "Attack (1)"],
             digits=4,
             zero_division=0,
             output_dict=True,
@@ -196,6 +235,8 @@ def evaluate_model(model: Sequential, X: np.ndarray, y: np.ndarray, name: str, b
     print(f"Accuracy: {result['accuracy']:.4f}")
     if result["auc_roc"] is not None:
         print(f"AUC-ROC : {result['auc_roc']:.4f}")
+        print(f"PR-AUC  : {result['pr_auc']:.4f}")
+    print(f"Threshold: {threshold:.4f}")
     print("Confusion matrix:")
     print(np.array(result["confusion_matrix"]))
     print("Classification report:")
@@ -203,7 +244,8 @@ def evaluate_model(model: Sequential, X: np.ndarray, y: np.ndarray, name: str, b
         classification_report(
             y,
             y_pred,
-            target_names=["Normal (0)", "Attack (1)"] if len(np.unique(y)) > 1 else None,
+            labels=[0, 1],
+            target_names=["Normal (0)", "Attack (1)"],
             digits=4,
             zero_division=0,
         )
@@ -242,8 +284,9 @@ def build_source_datasets(args: argparse.Namespace) -> tuple[dict[str, dict[str,
             "html_unescape": False,
             "lowercase": False,
             "whitespace_normalization_only": True,
-            "csic_payload_policy": "Use raw query/body parameter values only; drop requests with no input values.",
-            "obfuscation_group_split": "Use original_pattern when available so variants of the same pattern stay in one split.",
+            "input_representation": "Unified HTTP envelope for every source.",
+            "csic_payload_policy": "Keep method, path, query, body, cookie and content type.",
+            "group_split": "Use canonical split_group for every source.",
             "tokenizer_rule": "Each model fits its tokenizer on its own dataset's train split only.",
         },
         "datasets": {},
@@ -291,6 +334,8 @@ def evaluation_summary_row(train_source: str, test_source: str, result: dict) ->
         "test_source": test_source,
         "accuracy": result["accuracy"],
         "auc_roc": result["auc_roc"],
+        "pr_auc": result["pr_auc"],
+        "decision_threshold": result["decision_threshold"],
         "attack_precision": metric_from_report(result, "Attack (1)", "precision"),
         "attack_recall": metric_from_report(result, "Attack (1)", "recall"),
         "attack_f1": metric_from_report(result, "Attack (1)", "f1-score"),
@@ -383,6 +428,23 @@ def train_and_evaluate_source_model(
 
     best_model = tf.keras.models.load_model(best_model_path)
 
+    threshold_strategy = getattr(args, "threshold_strategy", "val_f1")
+    if threshold_strategy == "val_f1":
+        val_prob = best_model.predict(X_val, batch_size=args.batch_size).flatten()
+        threshold_selection = choose_validation_threshold(y_val, val_prob)
+    else:
+        threshold_selection = {
+            "threshold": DECISION_THRESHOLD,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+        }
+    selected_threshold = float(threshold_selection["threshold"])
+    print(
+        f"Decision threshold ({threshold_strategy}): "
+        f"{selected_threshold:.4f}"
+    )
+
     evaluations = {}
     summary_rows = []
     for test_source, splits in dataset_splits.items():
@@ -395,6 +457,7 @@ def train_and_evaluate_source_model(
             y_test,
             f"{train_source} model on {test_source} test",
             args.batch_size,
+            selected_threshold,
         )
         evaluations[test_source] = result
         summary_rows.append(evaluation_summary_row(train_source, test_source, result))
@@ -404,17 +467,20 @@ def train_and_evaluate_source_model(
         "seed": args.seed,
         "preprocessing_source": "preprocessing/preprocess_data.py",
         "split_target": {"train": 0.72, "validation": 0.08, "test": 0.20},
-        "group_column": "original_pattern" if train_source == "obfuscation" else None,
+        "group_column": "split_group",
         "url_decode": False,
         "html_unescape": False,
         "lowercase": False,
         "whitespace_normalization_only": True,
+        "input_representation": "unified_http_envelope",
         "tokenizer_fit_split": "train",
         "vocab_size": int(vocab_size),
         "max_len": int(args.max_len),
         "padding": "post",
         "truncating": "post",
-        "decision_threshold": DECISION_THRESHOLD,
+        "decision_threshold": selected_threshold,
+        "threshold_strategy": threshold_strategy,
+        "threshold_selection_on_validation": threshold_selection,
         "class_weight": {str(key): float(value) for key, value in class_weight_dict.items()},
         "splits": {
             split_name: prep.summarize(split_df)
@@ -450,7 +516,8 @@ def train_and_evaluate_source_model(
             "early_stopping_mode": "min",
             "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
             "early_stopping_patience": 3,
-            "decision_threshold": DECISION_THRESHOLD,
+            "decision_threshold": selected_threshold,
+            "threshold_strategy": threshold_strategy,
             "artifacts": {
                 "best_model": str(best_model_path),
                 "last_model": str(last_model_path),
@@ -483,6 +550,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--val-size", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--threshold-strategy",
+        choices=["val_f1", "fixed"],
+        default="val_f1",
+        help="Tune threshold for attack F1 on validation data or keep fixed 0.5.",
+    )
     parser.add_argument("--sample-size", type=int, default=None, help="Optional quick-run sample size for each non-obfuscation dataset.")
     parser.add_argument("--obfu-sample-size", type=int, default=None, help="Optional quick-run sample size for the obfuscation dataset.")
     parser.add_argument(
@@ -512,7 +585,18 @@ def main() -> None:
             f"test={len(splits['test']):,}"
         )
 
-    train_sources = resolve_train_sources(args.train_sources, list(dataset_splits.keys()))
+    trainable_sources = [
+        name
+        for name, splits in dataset_splits.items()
+        if splits["train"]["label"].nunique() >= 2
+    ]
+    evaluation_only_sources = sorted(set(dataset_splits) - set(trainable_sources))
+    if evaluation_only_sources:
+        print(
+            "Evaluation-only source(s), skipped for standalone binary training: "
+            + ", ".join(evaluation_only_sources)
+        )
+    train_sources = resolve_train_sources(args.train_sources, trainable_sources)
     print(f"\nTraining separate models for: {', '.join(train_sources)}")
 
     all_model_results = {}
