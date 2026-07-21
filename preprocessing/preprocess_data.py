@@ -1,10 +1,12 @@
 import argparse
+import hashlib
 import json
 import re
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
@@ -12,7 +14,7 @@ from sklearn.model_selection import train_test_split
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
 CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
-OBFU_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full_with_benign_shaped.xlsx")
+OBFU_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
 OUTPUT_DIR = str(PROJECT_ROOT / "cnn_lstm" / "artifacts" / "processed_data")
 RANDOM_STATE = 42
 
@@ -22,6 +24,96 @@ def normalize_payload(value: object) -> str:
     if not isinstance(value, str):
         return ""
     return re.sub(r"\s+", " ", value).strip()
+
+
+def stable_choice(value: str, choices: list[tuple[str, str, str, str]]) -> tuple[str, str, str, str]:
+    """Choose a neutral HTTP wrapper deterministically, without using the label."""
+    digest = hashlib.sha256(value.encode("utf-8", errors="ignore")).digest()
+    return choices[int.from_bytes(digest[:4], "big") % len(choices)]
+
+
+def serialize_http_request(
+    method: object = "",
+    path: object = "",
+    query: object = "",
+    body: object = "",
+    cookie: object = "",
+    content_type: object = "",
+) -> str:
+    """Serialize heterogeneous sources into one source-agnostic model input."""
+    fields = (
+        ("METHOD", method),
+        ("PATH", path),
+        ("QUERY", query),
+        ("BODY", body),
+        ("COOKIE", cookie),
+        ("CONTENT_TYPE", content_type),
+    )
+    return " ".join(
+        f"[{name}] {normalize_payload(value)}"
+        for name, value in fields
+    ).strip()
+
+
+PAYLOAD_HTTP_TEMPLATES = [
+    ("POST", "/submit", "body", "input"),
+    ("GET", "/search", "query", "q"),
+    ("POST", "/comment", "body", "text"),
+    ("GET", "/product", "query", "id"),
+    ("POST", "/login", "body", "username"),
+]
+
+
+def wrap_payload_as_request(payload: object) -> tuple[str, str]:
+    """Place payload-only samples in a neutral HTTP envelope shared by both labels."""
+    raw_payload = normalize_payload(payload)
+    if not raw_payload:
+        return "", ""
+    # Variants that differ only in encoding/numbers receive the same wrapper,
+    # which keeps the wrapper itself from defeating family-based splitting.
+    wrapper_key = re.sub(r"\d+", "<num>", re.sub(r"%[0-9a-fA-F]{2}", "%hh", raw_payload.lower()))
+    method, path, location, parameter = stable_choice(wrapper_key, PAYLOAD_HTTP_TEMPLATES)
+    parameter_value = f"{parameter}={raw_payload}"
+    query = parameter_value if location == "query" else ""
+    body = parameter_value if location == "body" else ""
+    content_type = "application/x-www-form-urlencoded" if body else ""
+    model_input = serialize_http_request(
+        method=method,
+        path=path,
+        query=query,
+        body=body,
+        content_type=content_type,
+    )
+    return model_input, raw_payload
+
+
+def canonical_payload_family(value: object) -> str:
+    """Group obvious variants so near-identical payloads cannot cross splits."""
+    text = normalize_payload(value).lower()
+    text = re.sub(r"%[0-9a-f]{2}", "%hh", text)
+    text = re.sub(r"\d+", "<num>", text)
+    return text
+
+
+def canonical_value_shape(value: object) -> str:
+    """Keep delimiters/encoding shape while removing request-specific values."""
+    text = normalize_payload(value).lower()
+    text = re.sub(r"%[0-9a-f]{2}", "%hh", text)
+    text = re.sub(r"[a-z0-9]+", "<text>", text)
+    return re.sub(r"(?:<text>){2,}", "<text>", text)
+
+
+def canonical_csic_family(method: object, path: object, query: object, body: object) -> str:
+    """Build a request family without cookies/session IDs or literal values."""
+    normalized_path = re.sub(r"\d+", "<num>", normalize_payload(path).lower())
+    return "|".join(
+        [
+            normalize_payload(method).lower(),
+            normalized_path,
+            canonical_value_shape(query),
+            canonical_value_shape(body),
+        ]
+    )
 
 
 def to_binary_label(series: pd.Series) -> pd.Series:
@@ -48,14 +140,17 @@ def load_kaggle(path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
 
+    wrapped = df["Sentence"].apply(wrap_payload_as_request)
     out = pd.DataFrame()
-    out["payload"] = df["Sentence"]
+    out["payload"] = wrapped.str[0]
+    out["raw_payload"] = wrapped.str[1]
     out["label"] = df[["SQLInjection", "XSS"]].max(axis=1).astype(int)
     out["source"] = "kaggle_sqli_xss"
     out["attack_type"] = "mixed"
     out["obfuscation_type"] = "original"
     out["pattern_category"] = ""
     out["difficulty_level"] = ""
+    out["split_group"] = out["payload"].apply(canonical_payload_family)
     return out
 
 
@@ -88,10 +183,30 @@ def extract_url_query(url: object) -> str:
     return request_url.split("?", 1)[1]
 
 
-def extract_csic_input_values(row: pd.Series) -> str:
-    body_values = extract_form_values(row.get("content", ""))
-    query_values = extract_form_values(extract_url_query(row.get("URL", "")))
-    return " ".join(value for value in [body_values, query_values] if value)
+def split_csic_url(url: object) -> tuple[str, str]:
+    """Return raw path and query without URL-decoding attack evidence."""
+    if not isinstance(url, str):
+        return "", ""
+    request_url = re.sub(r"\s+HTTP/\d(?:\.\d)?\s*$", "", url.strip())
+    request_url = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", request_url)
+    path, separator, query = request_url.partition("?")
+    return path or "/", query if separator else ""
+
+
+def serialize_csic_row(row: pd.Series) -> tuple[str, str, str]:
+    path, query = split_csic_url(row.get("URL", ""))
+    body = normalize_payload(row.get("content", ""))
+    model_input = serialize_http_request(
+        method=row.get("Method", ""),
+        path=path,
+        query=query,
+        body=body,
+        cookie=row.get("cookie", ""),
+        content_type=row.get("content-type", ""),
+    )
+    raw_payload = " ".join(value for value in (query, body) if value)
+    split_group = canonical_csic_family(row.get("Method", ""), path, query, body)
+    return model_input, raw_payload, split_group
 
 
 def load_csic(path: str) -> pd.DataFrame:
@@ -101,8 +216,11 @@ def load_csic(path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
 
+    serialized = df.apply(serialize_csic_row, axis=1)
     out = pd.DataFrame()
-    out["payload"] = df.apply(extract_csic_input_values, axis=1)
+    out["payload"] = serialized.str[0]
+    out["raw_payload"] = serialized.str[1]
+    out["split_group"] = serialized.str[2]
     out["label"] = to_binary_label(df["classification"])
     out["source"] = "csic_2010"
     out["attack_type"] = "mixed"
@@ -159,8 +277,10 @@ def load_obfuscation(path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
 
+    wrapped = df["obfuscated_input"].apply(wrap_payload_as_request)
     out = pd.DataFrame()
-    out["payload"] = df["obfuscated_input"]
+    out["payload"] = wrapped.str[0]
+    out["raw_payload"] = wrapped.str[1]
     out["label"] = to_binary_label(df["label"])
     out["source"] = "custom_obfuscation"
     out["attack_type"] = df["label"].astype(str).str.lower()
@@ -169,6 +289,11 @@ def load_obfuscation(path: str) -> pd.DataFrame:
     out["difficulty_level"] = df["difficulty_level"] if "difficulty_level" in df.columns else ""
     if "original_pattern" in df.columns:
         out["original_pattern"] = df["original_pattern"]
+        out["split_group"] = df["original_pattern"].fillna("").astype(str).apply(
+            canonical_payload_family
+        )
+    else:
+        out["split_group"] = out["payload"].apply(canonical_payload_family)
     return out
 
 
@@ -177,7 +302,15 @@ def clean(df: pd.DataFrame, deduplicate: bool = True, drop_label_conflicts: bool
     cleaned["payload"] = cleaned["payload"].apply(normalize_payload)
     cleaned["label"] = to_binary_label(cleaned["label"])
 
-    for column in ["source", "attack_type", "obfuscation_type", "pattern_category", "difficulty_level"]:
+    for column in [
+        "raw_payload",
+        "split_group",
+        "source",
+        "attack_type",
+        "obfuscation_type",
+        "pattern_category",
+        "difficulty_level",
+    ]:
         if column not in cleaned.columns:
             cleaned[column] = ""
         cleaned[column] = cleaned[column].fillna("").astype(str)
@@ -210,6 +343,8 @@ def summarize(df: pd.DataFrame) -> dict:
         summary["obfuscation_counts"] = {
             str(k): int(v) for k, v in df["obfuscation_type"].value_counts().head(30).items()
         }
+    if "split_group" in df.columns:
+        summary["unique_split_groups"] = int(df["split_group"].nunique(dropna=False))
     return summary
 
 
@@ -230,9 +365,15 @@ def split_dataset(
     if not 0 < val_size < 1:
         raise ValueError("--val-size must be between 0 and 1.")
 
+    if group_column and group_column in df.columns:
+        return split_dataset_by_group(
+            df.reset_index(drop=True),
+            test_size,
+            val_size,
+            seed,
+            group_column,
+        )
     shuffled = df.sample(frac=1, random_state=seed).reset_index(drop=True)
-    if group_column and group_column in shuffled.columns:
-        return split_dataset_by_group(shuffled, test_size, val_size, seed, group_column)
     return split_dataset_by_row(shuffled, test_size, val_size, seed)
 
 
@@ -279,23 +420,78 @@ def split_dataset_by_group(
     group_key = df[group_column].fillna("").astype(str)
     group_key = group_key.where(group_key.str.len() > 0, df["payload"])
 
-    group_frame = (
-        pd.DataFrame({"group_key": group_key, "label": df["label"]})
-        .groupby("group_key", as_index=False)["label"]
-        .agg(lambda values: values.mode().iloc[0])
+    test_keys = select_balanced_group_holdout(df, group_key, test_size, seed)
+    train_val_mask = ~group_key.isin(test_keys)
+    train_val_df = df[train_val_mask]
+    train_val_group_key = group_key[train_val_mask]
+    val_keys = select_balanced_group_holdout(
+        train_val_df,
+        train_val_group_key,
+        val_size,
+        seed + 1,
     )
-    train_val_groups, test_groups = safe_train_test_split(group_frame, test_size, seed)
-    train_groups, val_groups = safe_train_test_split(train_val_groups, val_size, seed)
-
-    train_keys = set(train_groups["group_key"])
-    val_keys = set(val_groups["group_key"])
-    test_keys = set(test_groups["group_key"])
+    train_keys = set(train_val_group_key) - val_keys
 
     return {
         "train": df[group_key.isin(train_keys)].reset_index(drop=True),
         "val": df[group_key.isin(val_keys)].reset_index(drop=True),
         "test": df[group_key.isin(test_keys)].reset_index(drop=True),
     }
+
+
+def select_balanced_group_holdout(
+    df: pd.DataFrame,
+    group_key: pd.Series,
+    holdout_fraction: float,
+    seed: int,
+) -> set[str]:
+    """Greedily choose whole groups while matching row and class targets."""
+    group_counts = (
+        pd.DataFrame(
+            {
+                "group_key": group_key.to_numpy(copy=False),
+                "label": df["label"].to_numpy(copy=False),
+            }
+        )
+        .groupby(["group_key", "label"], sort=False)
+        .size()
+        .unstack(fill_value=0)
+    )
+    for label in (0, 1):
+        if label not in group_counts.columns:
+            group_counts[label] = 0
+    group_counts = group_counts[[0, 1]]
+
+    count_values = group_counts[[0, 1]].to_numpy(dtype=np.float64, copy=False)
+    targets = count_values.sum(axis=0) * holdout_fraction
+    denominators = np.maximum(targets, 1.0)
+    selected_counts = np.zeros(2, dtype=np.float64)
+    selected: set[str] = set()
+
+    rng = np.random.default_rng(seed)
+    shuffled_positions = rng.permutation(len(group_counts))
+    totals = count_values.sum(axis=1)
+    mixed = ((count_values[:, 0] > 0) & (count_values[:, 1] > 0)).astype(np.int8)
+    order_within_shuffle = np.lexsort(
+        (totals[shuffled_positions], mixed[shuffled_positions])
+    )
+    ordered_positions = shuffled_positions[order_within_shuffle]
+    group_names = group_counts.index.to_numpy(copy=False)
+
+    def cost(counts: np.ndarray) -> float:
+        return float(np.square((counts - targets) / denominators).sum())
+
+    for position in ordered_positions:
+        candidate_counts = selected_counts + count_values[position]
+        if cost(candidate_counts) < cost(selected_counts):
+            selected.add(str(group_names[position]))
+            selected_counts = candidate_counts
+
+    if not selected and len(group_counts):
+        selected.add(str(group_counts.index[0]))
+    if len(selected) == len(group_counts) and len(selected) > 1:
+        selected.remove(str(group_counts.index[-1]))
+    return selected
 
 
 def load_clean_datasets(kaggle_path: str, csic_path: str, obfu_path: str) -> dict[str, pd.DataFrame]:
@@ -318,7 +514,7 @@ def split_all_datasets(
 ) -> dict[str, dict[str, pd.DataFrame]]:
     output = {}
     for name, frame in datasets.items():
-        group_column = "original_pattern" if name == "obfuscation" else None
+        group_column = "split_group"
         output[name] = split_dataset(frame, test_size, val_size, seed, group_column=group_column)
     return output
 
@@ -340,8 +536,10 @@ def build_dataset_splits(
             "lowercase": False,
             "whitespace_normalization_only": True,
             "deduplicate_by": ["payload", "label"],
-            "csic_payload_policy": "Use raw query/body parameter values only; drop requests with no input values.",
-            "obfuscation_group_split": "Use original_pattern when available so variants of the same pattern stay in one split.",
+            "input_representation": "Unified HTTP envelope with METHOD, PATH, QUERY, BODY, COOKIE and CONTENT_TYPE fields.",
+            "payload_only_policy": "Wrap Kaggle and obfuscation payloads in deterministic, label-independent HTTP templates.",
+            "csic_payload_policy": "Keep raw method, path, query, body, cookie and content type; do not drop requests without parameters.",
+            "group_split": "Split every source by canonical split_group; obfuscation uses original_pattern when available.",
             "tokenizer_rule": "Each model fits its tokenizer on that dataset's train split only.",
         },
         "datasets": {},
