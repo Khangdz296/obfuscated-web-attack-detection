@@ -17,6 +17,8 @@ CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
 OBFU_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
 OUTPUT_DIR = str(PROJECT_ROOT / "cnn_lstm" / "artifacts" / "processed_data")
 RANDOM_STATE = 42
+DEFAULT_SPLIT_PROTOCOL = "random_stratified_row"
+SPLIT_PROTOCOLS = {"random_stratified_row", "family_group"}
 
 
 def normalize_payload(value: object) -> str:
@@ -511,11 +513,24 @@ def split_all_datasets(
     test_size: float,
     val_size: float,
     seed: int,
+    split_protocol: str = DEFAULT_SPLIT_PROTOCOL,
 ) -> dict[str, dict[str, pd.DataFrame]]:
+    if split_protocol not in SPLIT_PROTOCOLS:
+        raise ValueError(
+            f"Unknown split protocol {split_protocol!r}; choose from {sorted(SPLIT_PROTOCOLS)}."
+        )
     output = {}
     for name, frame in datasets.items():
-        group_column = "split_group"
-        output[name] = split_dataset(frame, test_size, val_size, seed, group_column=group_column)
+        if split_protocol == "random_stratified_row":
+            output[name] = split_dataset_by_row(frame, test_size, val_size, seed)
+        else:
+            output[name] = split_dataset(
+                frame,
+                test_size,
+                val_size,
+                seed,
+                group_column="split_group",
+            )
     return output
 
 
@@ -526,9 +541,12 @@ def build_dataset_splits(
     test_size: float,
     val_size: float,
     seed: int,
+    split_protocol: str = DEFAULT_SPLIT_PROTOCOL,
 ) -> tuple[dict[str, dict[str, pd.DataFrame]], dict]:
     datasets = load_clean_datasets(kaggle_path, csic_path, obfu_path)
-    dataset_splits = split_all_datasets(datasets, test_size, val_size, seed)
+    dataset_splits = split_all_datasets(
+        datasets, test_size, val_size, seed, split_protocol=split_protocol
+    )
     metadata = {
         "preprocessing_policy": {
             "url_decode": False,
@@ -539,7 +557,12 @@ def build_dataset_splits(
             "input_representation": "Unified HTTP envelope with METHOD, PATH, QUERY, BODY, COOKIE and CONTENT_TYPE fields.",
             "payload_only_policy": "Wrap Kaggle and obfuscation payloads in deterministic, label-independent HTTP templates.",
             "csic_payload_policy": "Keep raw method, path, query, body, cookie and content type; do not drop requests without parameters.",
-            "group_split": "Split every source by canonical split_group; obfuscation uses original_pattern when available.",
+            "split_protocol": split_protocol,
+            "split_protocol_note": (
+                "Stratified row split: request families may cross train, validation, and test."
+                if split_protocol == "random_stratified_row"
+                else "Family-group split: canonical split_group never crosses train, validation, and test."
+            ),
             "tokenizer_rule": "Each model fits its tokenizer on that dataset's train split only.",
         },
         "datasets": {},
@@ -567,6 +590,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--val-size", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=RANDOM_STATE)
+    parser.add_argument(
+        "--split-protocol",
+        choices=sorted(SPLIT_PROTOCOLS),
+        default=DEFAULT_SPLIT_PROTOCOL,
+    )
     return parser.parse_args()
 
 
@@ -582,6 +610,7 @@ def main() -> None:
         args.test_size,
         args.val_size,
         args.seed,
+        args.split_protocol,
     )
     save_dataset_splits(dataset_splits, output_dir)
 
