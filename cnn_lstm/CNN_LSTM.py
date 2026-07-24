@@ -277,7 +277,13 @@ def build_source_datasets(args: argparse.Namespace) -> tuple[dict[str, dict[str,
             frame = frame.sample(n=min(sample_size, len(frame)), random_state=args.seed).reset_index(drop=True)
         sampled_datasets[name] = frame
 
-    dataset_splits = prep.split_all_datasets(sampled_datasets, args.test_size, args.val_size, args.seed)
+    dataset_splits = prep.split_all_datasets(
+        sampled_datasets,
+        args.test_size,
+        args.val_size,
+        args.seed,
+        split_protocol=args.split_protocol,
+    )
     metadata = {
         "preprocessing_policy": {
             "url_decode": False,
@@ -286,7 +292,12 @@ def build_source_datasets(args: argparse.Namespace) -> tuple[dict[str, dict[str,
             "whitespace_normalization_only": True,
             "input_representation": "Unified HTTP envelope for every source.",
             "csic_payload_policy": "Keep method, path, query, body, cookie and content type.",
-            "group_split": "Use canonical split_group for every source.",
+            "split_protocol": args.split_protocol,
+            "split_protocol_note": (
+                "Stratified row split: request families may cross splits."
+                if args.split_protocol == "random_stratified_row"
+                else "Family-group split: canonical split_group never crosses splits."
+            ),
             "tokenizer_rule": "Each model fits its tokenizer on its own dataset's train split only.",
         },
         "datasets": {},
@@ -550,6 +561,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--val-size", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--split-protocol",
+        choices=sorted(prep.SPLIT_PROTOCOLS),
+        default=prep.DEFAULT_SPLIT_PROTOCOL,
+    )
     parser.add_argument(
         "--threshold-strategy",
         choices=["val_f1", "fixed"],
