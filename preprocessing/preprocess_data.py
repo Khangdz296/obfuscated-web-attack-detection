@@ -12,9 +12,10 @@ from sklearn.model_selection import train_test_split
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
-CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
-OBFU_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
+DATA_DIR = PROJECT_ROOT / "DataSet"
+KAGGLE_PATH = str(DATA_DIR / "SQLInjection_XSS_MixDataset.1.0.0.csv")
+CSIC_PATH = str(DATA_DIR / "csic_database.csv")
+OBFU_PATH = str(DATA_DIR / "obfu_http_dataset_v2.csv")
 OUTPUT_DIR = str(PROJECT_ROOT / "cnn_lstm" / "artifacts" / "processed_data")
 RANDOM_STATE = 42
 DEFAULT_SPLIT_PROTOCOL = "random_stratified_row"
@@ -41,6 +42,7 @@ def serialize_http_request(
     body: object = "",
     cookie: object = "",
     content_type: object = "",
+    user_agent: object = "",
 ) -> str:
     """Serialize heterogeneous sources into one source-agnostic model input."""
     fields = (
@@ -50,6 +52,7 @@ def serialize_http_request(
         ("BODY", body),
         ("COOKIE", cookie),
         ("CONTENT_TYPE", content_type),
+        ("USER_AGENT", user_agent),
     )
     return " ".join(
         f"[{name}] {normalize_payload(value)}"
@@ -120,8 +123,10 @@ def canonical_csic_family(method: object, path: object, query: object, body: obj
 
 def to_binary_label(series: pd.Series) -> pd.Series:
     text = series.astype(str).str.strip().str.lower()
-    attack_words = {"1", "true", "attack", "attacks", "malicious", "sqli", "sql", "xss"}
-    normal_words = {"0", "false", "normal", "benign", "clean"}
+    attack_words = {
+        "1", "true", "attack", "attacks", "malicious", "sqli", "sql", "xss", "anomalous",
+    }
+    normal_words = {"0", "false", "normal", "benign", "clean", "none"}
 
     mapped = []
     for value in text:
@@ -297,6 +302,95 @@ def load_obfuscation(path: str) -> pd.DataFrame:
     else:
         out["split_group"] = out["payload"].apply(canonical_payload_family)
     return out
+
+
+def serialize_obfu_http_row(row: pd.Series) -> tuple[str, str, str]:
+    """Serialize a CSIC-style row, keeping cookie and User-Agent as attack carriers."""
+    path, query = split_csic_url(row.get("url", ""))
+    body = normalize_payload(row.get("content", ""))
+    cookie = normalize_payload(row.get("cookie", ""))
+    user_agent = normalize_payload(row.get("user_agent", ""))
+    model_input = serialize_http_request(
+        method=row.get("method", ""),
+        path=path,
+        query=query,
+        body=body,
+        cookie=cookie,
+        content_type=row.get("content_type", ""),
+        user_agent=user_agent,
+    )
+    raw_payload = " ".join(value for value in (query, body, cookie, user_agent) if value)
+    split_group = canonical_csic_family(row.get("method", ""), path, query, body)
+    return model_input, raw_payload, split_group
+
+
+def load_obfu_http(path: str, drop_second_order_triggers: bool = True) -> pd.DataFrame:
+    """Load the CSIC-style obfuscated HTTP dataset (method/url/classification schema)."""
+    df = pd.read_csv(path)
+    required = {"method", "url", "classification"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path} is missing columns: {sorted(missing)}")
+
+    if drop_second_order_triggers and {"is_second_order", "context_location"} <= set(df.columns):
+        # Trigger rows are labelled anomalous but carry no payload, so a
+        # single-request classifier cannot learn anything from them.
+        is_trigger = (
+            df["is_second_order"].astype(str).str.strip().str.lower().eq("true")
+            & df["context_location"].fillna("").astype(str).str.strip().eq("")
+        )
+        df = df[~is_trigger].reset_index(drop=True)
+
+    serialized = df.apply(serialize_obfu_http_row, axis=1)
+    out = pd.DataFrame()
+    out["payload"] = serialized.str[0]
+    out["raw_payload"] = serialized.str[1]
+    out["split_group"] = serialized.str[2]
+    out["label"] = to_binary_label(df["classification"])
+    out["source"] = "obfu_http"
+    for source_column, target_column in [
+        ("attack_category", "attack_type"),
+        ("obfuscation_type", "obfuscation_type"),
+        ("context_location", "pattern_category"),
+        ("difficulty_level", "difficulty_level"),
+        ("obfuscation_techniques", "obfuscation_techniques"),
+        # v2 columns. benign_kind tells false positives apart by the kind of
+        # legitimate traffic that triggered them; attack_technique shows which
+        # attack families are blind spots; seed_id ties a row back to its
+        # original payload for leakage checks.
+        ("benign_kind", "benign_kind"),
+        ("attack_technique", "attack_technique"),
+        ("seed_id", "seed_id"),
+        ("split", "split"),
+    ]:
+        out[target_column] = (
+            df[source_column].fillna("").astype(str) if source_column in df.columns else ""
+        )
+    return out
+
+
+def split_dataset_by_column(df: pd.DataFrame, split_column: str = "split") -> dict[str, pd.DataFrame]:
+    """Use the split assignment shipped with the dataset instead of re-splitting it."""
+    if split_column not in df.columns:
+        raise ValueError(f"Dataset has no {split_column!r} column to split on.")
+
+    values = df[split_column].fillna("").astype(str).str.strip().str.lower()
+    # v1 shipped train/val/test/test_heldout. v2 replaces the single held-out
+    # set with three, each isolating a different kind of generalisation:
+    #   test_unseen_technique  payload seen in training, encoding never seen
+    #   test_unseen_seed       encoding seen in training, payload never seen
+    #   test_unseen_both       neither seen
+    known = ("train", "val", "test", "test_heldout",
+             "test_unseen_technique", "test_unseen_seed", "test_unseen_both")
+    splits = {
+        name: df[values == name].reset_index(drop=True)
+        for name in known
+    }
+    missing = [name for name in ("train", "val", "test") if splits[name].empty]
+    if missing:
+        raise ValueError(f"Column {split_column!r} produced empty split(s): {missing}")
+    return {name: part for name, part in splits.items()
+            if name in ("train", "val", "test") or not part.empty}
 
 
 def clean(df: pd.DataFrame, deduplicate: bool = True, drop_label_conflicts: bool = True) -> pd.DataFrame:
@@ -496,16 +590,45 @@ def select_balanced_group_holdout(
     return selected
 
 
-def load_clean_datasets(kaggle_path: str, csic_path: str, obfu_path: str) -> dict[str, pd.DataFrame]:
-    return {
-        "kaggle": clean(load_kaggle(kaggle_path), deduplicate=True, drop_label_conflicts=True),
-        "csic": clean(load_csic(csic_path), deduplicate=True, drop_label_conflicts=True),
-        "obfuscation": clean(
-            load_obfuscation(obfu_path),
-            deduplicate=True,
-            drop_label_conflicts=False,
-        ),
+DATASET_SOURCES = ("kaggle", "csic", "obfu_http")
+
+
+def load_clean_datasets(
+    kaggle_path: str,
+    csic_path: str,
+    obfu_path: str,
+    sources: list[str] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Load and clean the requested sources.
+
+    Serialising a source costs a per-row pass, so loading all three when only
+    one is needed wastes a couple of minutes on every run. The loaders are kept
+    behind lambdas so an unrequested source is never read from disk at all.
+
+    `sources=None` (or "all") keeps the original behaviour of loading
+    everything, which is what cross-source evaluation needs.
+    """
+    loaders = {
+        "kaggle": lambda: clean(load_kaggle(kaggle_path),
+                                deduplicate=True, drop_label_conflicts=True),
+        "csic": lambda: clean(load_csic(csic_path),
+                              deduplicate=True, drop_label_conflicts=True),
+        "obfu_http": lambda: clean(load_obfu_http(obfu_path),
+                                   deduplicate=True, drop_label_conflicts=False),
     }
+
+    if not sources or "all" in sources:
+        wanted = list(DATASET_SOURCES)
+    else:
+        unknown = sorted(set(sources) - set(loaders))
+        if unknown:
+            raise ValueError(
+                f"Unknown dataset source(s): {unknown}. "
+                f"Available: {sorted(loaders)} (or 'all')."
+            )
+        wanted = [name for name in DATASET_SOURCES if name in sources]
+
+    return {name: loaders[name]() for name in wanted}
 
 
 def split_all_datasets(
@@ -521,7 +644,14 @@ def split_all_datasets(
         )
     output = {}
     for name, frame in datasets.items():
-        if split_protocol == "random_stratified_row":
+        ships_own_split = (
+            "split" in frame.columns
+            and frame["split"].fillna("").astype(str).str.strip().ne("").any()
+        )
+        if ships_own_split:
+            # The dataset author encoded a held-out design a generic splitter cannot rebuild.
+            output[name] = split_dataset_by_column(frame)
+        elif split_protocol == "random_stratified_row":
             output[name] = split_dataset_by_row(frame, test_size, val_size, seed)
         else:
             output[name] = split_dataset(

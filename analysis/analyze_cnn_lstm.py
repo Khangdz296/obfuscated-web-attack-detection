@@ -23,7 +23,26 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 DEFAULT_ARTIFACT_DIR = str(
     Path(__file__).resolve().parent.parent / "cnn_lstm" / "artifacts"
 )
-DEFAULT_MAX_LEN = 1024
+DEFAULT_MAX_LEN = 768
+DEFAULT_SOURCE = "obfu_http"
+
+# Columns worth grouping the results by. The last two only exist on the v2
+# dataset; missing ones are skipped silently.
+GROUP_COLUMNS = ["obfuscation_type", "attack_type", "difficulty_level",
+                 "pattern_category", "attack_technique", "benign_kind"]
+
+
+def resolve_model_dir(artifact_dir: Path, source: str) -> Path:
+    """Find where CNN_LSTM.py actually saved the model for this source.
+
+    Per-source runs write to artifacts/by_dataset/<source>/, while the older
+    single-model layout wrote straight into artifacts/. Prefer the per-source
+    directory and fall back, so both layouts keep working.
+    """
+    candidate = artifact_dir / "by_dataset" / source
+    if (candidate / "best_hybrid_cnn_lstm.keras").exists():
+        return candidate
+    return artifact_dir
 
 
 def load_artifacts(artifact_dir: Path):
@@ -129,6 +148,39 @@ def grouped_attack_recall(df: pd.DataFrame, y_prob: np.ndarray, threshold: float
     return grouped
 
 
+def grouped_false_positive_rate(df: pd.DataFrame, y_prob: np.ndarray,
+                                threshold: float, group_col: str) -> pd.DataFrame:
+    """False alarms per kind of legitimate traffic.
+
+    grouped_attack_recall() cannot answer this: a benign group contains only
+    label 0 rows, so its recall is always zero. What matters for benign traffic
+    is how often the model cries wolf, broken down by the kind of legitimate
+    content -- ordinary requests versus hard negatives such as obfuscated but
+    harmless payloads.
+    """
+    if group_col not in df.columns:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["probability"] = y_prob
+    work["predicted"] = (work["probability"] >= threshold).astype(int)
+    work = work[work["label"].astype(int) == 0]
+    if work.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        work.groupby(group_col, dropna=False)
+        .agg(samples=("payload", "size"),
+             false_positives=("predicted", "sum"),
+             avg_probability=("probability", "mean"))
+        .reset_index()
+    )
+    grouped["false_positive_rate"] = (
+        grouped["false_positives"] / grouped["samples"].clip(lower=1))
+    return grouped.sort_values(["false_positive_rate", "samples"],
+                               ascending=[False, False])
+
+
 def export_false_negatives(df: pd.DataFrame, y_prob: np.ndarray, threshold: float, path: Path, limit: int) -> None:
     work = df.copy()
     work["probability"] = y_prob
@@ -138,9 +190,32 @@ def export_false_negatives(df: pd.DataFrame, y_prob: np.ndarray, threshold: floa
     missed.to_csv(path, index=False, encoding="utf-8")
 
 
+def load_split_frames(artifact_dir: Path, source: str) -> dict[str, pd.DataFrame]:
+    """Read whatever splits CNN_LSTM.py actually wrote for one source.
+
+    CNN_LSTM.py writes artifacts/processed_data_by_dataset/<source>/<split>.csv.
+    This script used to read artifacts/processed_data/{val,test,obfuscated_test}.csv,
+    which is the legacy layout produced by build_datasets() -- a function main()
+    no longer calls. Reading the directory means the three v2 generalisation
+    splits are picked up automatically instead of being silently ignored.
+    """
+    source_dir = artifact_dir / "processed_data_by_dataset" / source
+    if not source_dir.is_dir():
+        raise FileNotFoundError(
+            f"Không thấy {source_dir}. Chạy cnn_lstm/CNN_LSTM.py trước, "
+            f"hoặc chỉ định --source cho đúng nguồn đã huấn luyện."
+        )
+    frames = {path.stem: pd.read_csv(path) for path in sorted(source_dir.glob("*.csv"))}
+    if not frames:
+        raise FileNotFoundError(f"{source_dir} rỗng.")
+    return frames
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze saved CNN-LSTM results without retraining.")
     parser.add_argument("--artifact-dir", default=DEFAULT_ARTIFACT_DIR)
+    parser.add_argument("--source", default=DEFAULT_SOURCE,
+                        help="Dataset source directory to analyse (obfu_http, csic, kaggle).")
     parser.add_argument("--max-len", type=int, default=DEFAULT_MAX_LEN)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -151,69 +226,78 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     artifact_dir = Path(args.artifact_dir)
-    processed_dir = artifact_dir / "processed_data"
-    output_dir = artifact_dir / "analysis"
+    output_dir = artifact_dir / "analysis" / args.source
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model, tokenizer = load_artifacts(artifact_dir)
-    val_df = pd.read_csv(processed_dir / "val.csv")
-    test_df = pd.read_csv(processed_dir / "test.csv")
-    obfu_df = pd.read_csv(processed_dir / "obfuscated_test.csv")
+    model_dir = resolve_model_dir(artifact_dir, args.source)
+    print(f"Loading model from: {model_dir}")
+    model, tokenizer = load_artifacts(model_dir)
+    frames = load_split_frames(artifact_dir, args.source)
 
-    print("Predicting validation probabilities...")
-    val_prob = predict_probabilities(model, tokenizer, val_df, args.max_len, args.batch_size)
-    print("Predicting normal test probabilities...")
-    test_prob = predict_probabilities(model, tokenizer, test_df, args.max_len, args.batch_size)
-    print("Predicting obfuscated test probabilities...")
-    obfu_prob = predict_probabilities(model, tokenizer, obfu_df, args.max_len, args.batch_size)
+    # Every split named test* is evaluated. On the v2 dataset that is the
+    # in-distribution test plus three generalisation splits; the difference
+    # between them is the result the project is after.
+    analysed = ["val"] + sorted(n for n in frames if n.startswith("test"))
+    analysed = [n for n in analysed if n in frames]
 
     thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-    threshold_table(val_df["label"].to_numpy(), val_prob, thresholds).to_csv(
-        output_dir / "thresholds_val.csv", index=False, encoding="utf-8"
-    )
-    threshold_table(test_df["label"].to_numpy(), test_prob, thresholds).to_csv(
-        output_dir / "thresholds_test.csv", index=False, encoding="utf-8"
-    )
-    threshold_table(obfu_df["label"].to_numpy(), obfu_prob, thresholds).to_csv(
-        output_dir / "thresholds_obfuscated_test.csv", index=False, encoding="utf-8"
-    )
+    probabilities: dict[str, np.ndarray] = {}
+    summary_splits: dict[str, dict] = {}
 
-    for group_col in ["obfuscation_type", "attack_type", "difficulty_level", "pattern_category"]:
-        grouped = grouped_attack_recall(obfu_df, obfu_prob, args.threshold, group_col)
-        if not grouped.empty:
-            grouped.to_csv(output_dir / f"obfuscated_recall_by_{group_col}.csv", index=False, encoding="utf-8")
+    for split_name in analysed:
+        frame = frames[split_name]
+        print(f"Predicting {split_name} probabilities ({len(frame):,} rows)...")
+        prob = predict_probabilities(model, tokenizer, frame, args.max_len, args.batch_size)
+        probabilities[split_name] = prob
+        truth = frame["label"].to_numpy()
 
-    export_false_negatives(
-        test_df,
-        test_prob,
-        args.threshold,
-        output_dir / "false_negatives_test.csv",
-        args.false_negative_limit,
-    )
-    export_false_negatives(
-        obfu_df,
-        obfu_prob,
-        args.threshold,
-        output_dir / "false_negatives_obfuscated_test.csv",
-        args.false_negative_limit,
-    )
+        threshold_table(truth, prob, thresholds).to_csv(
+            output_dir / f"thresholds_{split_name}.csv", index=False, encoding="utf-8")
+
+        if split_name != "val":
+            summary_splits[split_name] = metrics_at_threshold(truth, prob, args.threshold)
+
+        for group_col in GROUP_COLUMNS:
+            grouped = grouped_attack_recall(frame, prob, args.threshold, group_col)
+            if not grouped.empty and grouped["detected"].sum() + grouped["missed"].sum() > 0:
+                grouped.to_csv(output_dir / f"{split_name}_recall_by_{group_col}.csv",
+                               index=False, encoding="utf-8")
+
+        false_positives = grouped_false_positive_rate(
+            frame, prob, args.threshold, "benign_kind")
+        if not false_positives.empty:
+            false_positives.to_csv(output_dir / f"{split_name}_false_positive_by_benign_kind.csv",
+                                   index=False, encoding="utf-8")
+
+        export_false_negatives(frame, prob, args.threshold,
+                               output_dir / f"false_negatives_{split_name}.csv",
+                               args.false_negative_limit)
+
+    # The headline number: how far recall falls between the in-distribution
+    # split and the hardest held-out one.
+    gap = None
+    if "test" in summary_splits and "test_unseen_both" in summary_splits:
+        gap = round((summary_splits["test"]["attack_recall"]
+                     - summary_splits["test_unseen_both"]["attack_recall"]) * 100, 2)
+
+    print("\n=== Attack recall @ threshold", args.threshold, "===")
+    for split_name, metrics in summary_splits.items():
+        print(f"  {split_name:24s} {metrics['attack_recall'] * 100:6.2f}%")
+    if gap is not None:
+        print(f"  {'GAP (test -> unseen_both)':24s} {gap:6.2f} điểm")
 
     summary = {
+        "source": args.source,
         "threshold": args.threshold,
-        "test": metrics_at_threshold(test_df["label"].to_numpy(), test_prob, args.threshold),
-        "obfuscated_test": metrics_at_threshold(obfu_df["label"].to_numpy(), obfu_prob, args.threshold),
-        "outputs": {
-            "thresholds_val": str(output_dir / "thresholds_val.csv"),
-            "thresholds_test": str(output_dir / "thresholds_test.csv"),
-            "thresholds_obfuscated_test": str(output_dir / "thresholds_obfuscated_test.csv"),
-            "false_negatives_test": str(output_dir / "false_negatives_test.csv"),
-            "false_negatives_obfuscated_test": str(output_dir / "false_negatives_obfuscated_test.csv"),
-        },
+        "max_len": args.max_len,
+        "splits": summary_splits,
+        "gap_test_to_unseen_both": gap,
+        "output_dir": str(output_dir),
     }
     with (output_dir / "analysis_summary.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, ensure_ascii=False, indent=2)
 
-    print(f"Analysis saved to: {output_dir.resolve()}")
+    print(f"\nAnalysis saved to: {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
