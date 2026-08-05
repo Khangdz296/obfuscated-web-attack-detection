@@ -368,7 +368,7 @@ Vì tập này không có mẫu Normal, Accuracy về mặt số học bằng At
 Notebook mục 6 đọc baseline từ:
 
 ```text
-cnn_lstm/artifacts/metadata_and_results.json
+cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/metadata_and_results.json
 ```
 
 Kết quả so sánh theo artifact hiện có:

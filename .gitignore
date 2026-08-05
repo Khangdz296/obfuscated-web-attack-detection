@@ -13,3 +13,5 @@ myvenv/
 
 # OS/editor noise
 .vscode/
+~$*.docx
+~WRL*.tmp

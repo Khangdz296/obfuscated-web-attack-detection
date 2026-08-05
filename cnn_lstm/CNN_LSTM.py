@@ -55,11 +55,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from preprocessing import preprocess_data as prep
 
-KAGGLE_PATH = str(PROJECT_ROOT / "SQLInjection_XSS_MixDataset.1.0.0.csv")
-CSIC_PATH = str(PROJECT_ROOT / "csic_database.csv")
-OBFUSCATION_PATH = str(PROJECT_ROOT / "obfuscation_dataset_full.xlsx")
-OUTPUT_DIR = str(MODEL_DIR / "artifacts")
-MAX_LEN = 1024
+KAGGLE_PATH = prep.KAGGLE_PATH
+CSIC_PATH = prep.CSIC_PATH
+OBFUSCATION_PATH = prep.OBFU_PATH
+OUTPUT_DIR = str(MODEL_DIR / "artifacts_cnn_lstm_by_dataset")
+MAX_LEN = 768
 EMBEDDING_DIM = 64
 SEED = 42
 DECISION_THRESHOLD = 0.5
@@ -70,6 +70,15 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
+
+
+def portable_artifact_path(path: Path) -> str:
+    """Prefer project-relative POSIX paths so artifacts remain portable."""
+    resolved_path = path.resolve()
+    try:
+        return resolved_path.relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        return str(resolved_path)
 
 
 # Legacy helper kept for cnn_only/cnn_bilstm/sequence_pool scripts that still
@@ -269,12 +278,23 @@ def save_processed_csvs(
 
 
 def build_source_datasets(args: argparse.Namespace) -> tuple[dict[str, dict[str, pd.DataFrame]], dict]:
-    datasets = prep.load_clean_datasets(args.kaggle_path, args.csic_path, args.obfuscation_path)
+    datasets = prep.load_clean_datasets(
+        args.kaggle_path, args.csic_path, args.obfuscation_path,
+        sources=getattr(args, "datasets", None),
+    )
     sampled_datasets = {}
     for name, frame in datasets.items():
-        sample_size = args.obfu_sample_size if name == "obfuscation" else args.sample_size
-        if sample_size:
-            frame = frame.sample(n=min(sample_size, len(frame)), random_state=args.seed).reset_index(drop=True)
+        sample_size = args.obfu_sample_size if name == "obfu_http" else args.sample_size
+        if sample_size and sample_size < len(frame):
+            if "split" in frame.columns:
+                # Sample inside each split so the shipped held-out design survives.
+                frame = (
+                    frame.groupby("split", sort=False)
+                    .sample(frac=sample_size / len(frame), random_state=args.seed)
+                    .reset_index(drop=True)
+                )
+            else:
+                frame = frame.sample(n=sample_size, random_state=args.seed).reset_index(drop=True)
         sampled_datasets[name] = frame
 
     dataset_splits = prep.split_all_datasets(
@@ -402,7 +422,6 @@ def train_and_evaluate_source_model(
     last_model_path = source_dir / "last_hybrid_cnn_lstm.keras"
     tokenizer_path = source_dir / "tokenizer.pkl"
     history_path = source_dir / "training_history.csv"
-    config_path = source_dir / "preprocessing_config.json"
     callbacks = [
         EarlyStopping(
             monitor="val_loss",
@@ -459,19 +478,27 @@ def train_and_evaluate_source_model(
     evaluations = {}
     summary_rows = []
     for test_source, splits in dataset_splits.items():
-        test_df = splits["test"]
-        X_test = vectorize(tokenizer, test_df["payload"], args.max_len)
-        y_test = test_df["label"].to_numpy(dtype=np.int32)
-        result = evaluate_model(
-            best_model,
-            X_test,
-            y_test,
-            f"{train_source} model on {test_source} test",
-            args.batch_size,
-            selected_threshold,
-        )
-        evaluations[test_source] = result
-        summary_rows.append(evaluation_summary_row(train_source, test_source, result))
+        # Evaluate on every split whose name starts with "test". v2 ships three
+        # generalisation splits alongside the in-distribution one, and the
+        # comparison between them is the actual result.
+        test_split_names = sorted(name for name in splits if name.startswith("test"))
+        for split_name in test_split_names:
+            if splits[split_name].empty:
+                continue
+            test_df = splits[split_name]
+            label = test_source if split_name == "test" else f"{test_source}:{split_name}"
+            X_test = vectorize(tokenizer, test_df["payload"], args.max_len)
+            y_test = test_df["label"].to_numpy(dtype=np.int32)
+            result = evaluate_model(
+                best_model,
+                X_test,
+                y_test,
+                f"{train_source} model on {label}",
+                args.batch_size,
+                selected_threshold,
+            )
+            evaluations[label] = result
+            summary_rows.append(evaluation_summary_row(train_source, label, result))
 
     preprocessing_config = {
         "dataset": train_source,
@@ -498,9 +525,6 @@ def train_and_evaluate_source_model(
             for split_name, split_df in dataset_splits[train_source].items()
         },
     }
-    with config_path.open("w", encoding="utf-8") as file:
-        json.dump(preprocessing_config, file, ensure_ascii=False, indent=2)
-
     model_metadata = {
         "train_source": train_source,
         "preprocessing": preprocessing_config,
@@ -530,11 +554,10 @@ def train_and_evaluate_source_model(
             "decision_threshold": selected_threshold,
             "threshold_strategy": threshold_strategy,
             "artifacts": {
-                "best_model": str(best_model_path),
-                "last_model": str(last_model_path),
-                "tokenizer": str(tokenizer_path),
-                "training_history": str(history_path),
-                "preprocessing_config": str(config_path),
+                "best_model": portable_artifact_path(best_model_path),
+                "last_model": portable_artifact_path(last_model_path),
+                "tokenizer": portable_artifact_path(tokenizer_path),
+                "training_history": portable_artifact_path(history_path),
             },
         },
         "training_history": {
@@ -578,7 +601,18 @@ def parse_args() -> argparse.Namespace:
         "--train-sources",
         nargs="+",
         default=["all"],
-        help="Datasets to train separate models for: all, kaggle, csic, obfuscation.",
+        help="Datasets to train separate models for: all, kaggle, csic, obfu_http.",
+    )
+    # Separate from --train-sources: this controls what gets *loaded*. Loading a
+    # source costs a per-row serialisation pass, so skipping the ones you are
+    # not using cuts start-up time. Every loaded source is still evaluated
+    # against every trained model, which is what cross-source evaluation needs.
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=["all"],
+        help="Datasets to load at all: all, kaggle, csic, obfu_http. "
+             "Use a subset to skip loading sources you are not evaluating on.",
     )
     return parser.parse_args()
 
@@ -594,12 +628,11 @@ def main() -> None:
 
     print("=== DATASETS PREPARED ===")
     for dataset_name, splits in dataset_splits.items():
-        print(
-            f"{dataset_name}: "
-            f"train={len(splits['train']):,} | "
-            f"val={len(splits['val']):,} | "
-            f"test={len(splits['test']):,}"
-        )
+        # Print every split, not just the first three. The v2 dataset ships
+        # three extra held-out splits; hiding them made the totals look wrong.
+        total = sum(len(part) for part in splits.values())
+        parts = " | ".join(f"{name}={len(part):,}" for name, part in splits.items())
+        print(f"{dataset_name} (tổng {total:,}): {parts}")
 
     trainable_sources = [
         name
@@ -641,13 +674,15 @@ def main() -> None:
         "trained_sources": train_sources,
         "models": all_model_results,
         "artifacts": {
-            "processed_data": str(output_dir / "processed_data_by_dataset"),
-            "models": str(output_dir / "by_dataset"),
-            "cross_eval_results": str(output_dir / "cross_eval_results.csv"),
-            "cross_eval_accuracy_matrix": str(output_dir / "cross_eval_accuracy_matrix.csv"),
+            "processed_data": portable_artifact_path(output_dir / "processed_data_by_dataset"),
+            "models": portable_artifact_path(output_dir / "by_dataset"),
+            "cross_eval_results": portable_artifact_path(output_dir / "cross_eval_results.csv"),
+            "cross_eval_accuracy_matrix": portable_artifact_path(
+                output_dir / "cross_eval_accuracy_matrix.csv"
+            ),
         },
     }
-    with (output_dir / "cross_eval_results.json").open("w", encoding="utf-8") as file:
+    with (output_dir / "experiment_results.json").open("w", encoding="utf-8") as file:
         json.dump(experiment_results, file, ensure_ascii=False, indent=2)
 
     print(f"\nSaved by-dataset artifacts to: {(output_dir / 'by_dataset').resolve()}")

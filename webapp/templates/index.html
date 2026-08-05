@@ -13,7 +13,8 @@
           <p class="eyebrow">Hybrid 1D-CNN + LSTM</p>
           <h1>Web Attack Detector</h1>
           <p class="subhead">
-            Nhập request, URL, payload hoặc chuỗi bất kỳ để model phân loại Normal/Attack.
+            Nhập raw HTTP request, URL hoặc payload. Backend sẽ tự chuyển input về
+            đúng HTTP envelope đã dùng khi huấn luyện trước khi phân loại.
           </p>
         </div>
 
@@ -40,7 +41,7 @@
       <section class="panel result-panel" aria-live="polite">
         <div class="result-card empty" id="result-card">
           <p class="result-label">Chưa có kết quả</p>
-          <p class="result-main">Gửi input để backend chạy qua tokenizer và model.</p>
+          <p class="result-main">Gửi input để backend tiền xử lý, tokenize và dự đoán.</p>
         </div>
 
         <div class="metrics">
@@ -56,10 +57,14 @@
             <span>Input length</span>
             <strong id="input-length">-</strong>
           </div>
+          <div>
+            <span>Detected input</span>
+            <strong id="input-kind">-</strong>
+          </div>
         </div>
 
         <div class="details">
-          <h2>Payload sau tiền xử lý</h2>
+          <h2>Input thực tế được đưa vào mô hình</h2>
           <pre id="normalized-payload">-</pre>
         </div>
 
