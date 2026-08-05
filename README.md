@@ -85,19 +85,20 @@ The script will:
 - train the Hybrid CNN-LSTM model;
 - evaluate the model on the normal test set and the obfuscated test set.
 
-After training, generated outputs are saved in:
+After training, generated outputs are saved in one by-dataset artifact root:
 
 ```text
-cnn_lstm/artifacts/
+cnn_lstm/artifacts_cnn_lstm_by_dataset/
 ```
 
 Important files:
 
 ```text
-cnn_lstm/artifacts/best_hybrid_cnn_lstm.keras
-cnn_lstm/artifacts/tokenizer.pkl
-cnn_lstm/artifacts/metadata_and_results.json
-cnn_lstm/artifacts/processed_data/
+cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/kaggle/
+cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/csic/
+cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/
+cnn_lstm/artifacts_cnn_lstm_by_dataset/processed_data_by_dataset/
+cnn_lstm/artifacts_cnn_lstm_by_dataset/experiment_results.json
 ```
 
 `metadata_and_results.json` contains the overall training/evaluation summary, including:
@@ -110,16 +111,16 @@ cnn_lstm/artifacts/processed_data/
 - confusion matrices;
 - classification reports.
 
-`cnn_lstm/artifacts/` is ignored by git because it contains generated models and outputs.
+`cnn_lstm/artifacts_cnn_lstm_by_dataset/` is ignored by git because it contains generated models and outputs.
 
 ## Stage 2: Run The Flask Web App
 
 The web app requires these files from Stage 1:
 
 ```text
-cnn_lstm/artifacts/best_hybrid_cnn_lstm.keras
-cnn_lstm/artifacts/tokenizer.pkl
-cnn_lstm/artifacts/metadata_and_results.json
+cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/best_hybrid_cnn_lstm.keras
+cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/tokenizer.pkl
+cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/metadata_and_results.json
 ```
 
 Start the Flask app:
@@ -162,7 +163,7 @@ Expected important fields:
 }
 ```
 
-If `model_exists` or `tokenizer_exists` is `false`, run Stage 1 first or copy the generated artifacts into `cnn_lstm/artifacts/`.
+If `model_exists` or `tokenizer_exists` is `false`, run Stage 1 first or copy the OBFU artifacts into `cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/`.
 
 ## Prediction API
 
@@ -199,5 +200,5 @@ Example response:
 ## Notes
 
 - The backend uses the same preprocessing policy as `CNN_LSTM.py`: preserve payload evidence and normalize only redundant whitespace.
-- The tokenizer is loaded from `cnn_lstm/artifacts/tokenizer.pkl`.
-- The model is loaded from `cnn_lstm/artifacts/best_hybrid_cnn_lstm.keras` with `compile=False` for inference.
+- The tokenizer is loaded from `cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/tokenizer.pkl`.
+- The model is loaded from `cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/best_hybrid_cnn_lstm.keras` with `compile=False` for inference.

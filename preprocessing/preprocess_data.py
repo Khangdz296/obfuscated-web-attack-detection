@@ -200,6 +200,72 @@ def split_csic_url(url: object) -> tuple[str, str]:
     return path or "/", query if separator else ""
 
 
+HTTP_METHODS = {
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"
+}
+HTTP_ENVELOPE_MARKERS = (
+    "[METHOD]", "[PATH]", "[QUERY]", "[BODY]",
+    "[COOKIE]", "[CONTENT_TYPE]", "[USER_AGENT]",
+)
+
+
+def preprocess_inference_input(value: object) -> tuple[str, str]:
+    """Convert WebApp input to the unified HTTP envelope used for training.
+
+    Detect an existing envelope, a raw HTTP request, a URL/path, or a
+    payload-only sample. URL encoding and letter case are deliberately kept
+    because they may carry obfuscation evidence.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Input is empty after whitespace normalization.")
+
+    raw_input = value.strip()
+    normalized_input = normalize_payload(raw_input)
+
+    if all(marker in normalized_input for marker in HTTP_ENVELOPE_MARKERS):
+        return normalized_input, "unified_http_envelope"
+
+    lines = raw_input.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    request_line = lines[0].strip()
+    request_match = re.match(
+        r"^([A-Za-z]+)\s+(\S+?)(?:\s+HTTP/\d(?:\.\d)?)?$",
+        request_line,
+    )
+    if request_match and request_match.group(1).upper() in HTTP_METHODS:
+        method = request_match.group(1).upper()
+        target = request_match.group(2)
+        headers: dict[str, str] = {}
+        body_start = len(lines)
+        for index, line in enumerate(lines[1:], start=1):
+            if not line.strip():
+                body_start = index + 1
+                break
+            if ":" in line:
+                name, header_value = line.split(":", 1)
+                headers[name.strip().lower()] = header_value.strip()
+
+        path, query = split_csic_url(target)
+        body = "\n".join(lines[body_start:]) if body_start < len(lines) else ""
+        model_input = serialize_http_request(
+            method=method,
+            path=path,
+            query=query,
+            body=body,
+            cookie=headers.get("cookie", ""),
+            content_type=headers.get("content-type", ""),
+            user_agent=headers.get("user-agent", ""),
+        )
+        return normalize_payload(model_input), "raw_http_request"
+
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw_input) or raw_input.startswith("/"):
+        path, query = split_csic_url(raw_input)
+        model_input = serialize_http_request(method="GET", path=path, query=query)
+        return normalize_payload(model_input), "url"
+
+    model_input, _ = wrap_payload_as_request(raw_input)
+    return normalize_payload(model_input), "payload"
+
+
 def serialize_csic_row(row: pd.Series) -> tuple[str, str, str]:
     path, query = split_csic_url(row.get("URL", ""))
     body = normalize_payload(row.get("content", ""))

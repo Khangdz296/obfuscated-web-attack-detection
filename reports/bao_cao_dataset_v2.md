@@ -373,7 +373,7 @@ không hề có các token `[METHOD]`, `[PATH]`, `[BODY]`.
 Cần cho webapp nhận các trường HTTP rời rạc rồi gọi `prep.serialize_http_request()`.
 
 Đóng gói artifact: webapp đọc cứng
-`cnn_lstm/artifacts/best_hybrid_cnn_lstm.keras`, `tokenizer.pkl`,
+`cnn_lstm/artifacts_cnn_lstm_by_dataset/by_dataset/obfu_http/best_hybrid_cnn_lstm.keras`, `tokenizer.pkl`,
 `metadata_and_results.json`. File cuối phải có `model.max_len = 768`, nếu thiếu
 webapp rơi về `DEFAULT_MAX_LEN = 1024` → pad sai → kết quả vô nghĩa.
 

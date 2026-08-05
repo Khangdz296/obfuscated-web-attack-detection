@@ -46,6 +46,7 @@ KAGGLE_PATH = pipeline.KAGGLE_PATH
 MAX_LEN = pipeline.MAX_LEN
 OBFUSCATION_PATH = pipeline.OBFUSCATION_PATH
 SEED = pipeline.SEED
+DECISION_THRESHOLD = pipeline.DECISION_THRESHOLD
 
 OUTPUT_DIR = str(MODEL_DIR / "artifacts_by_dataset")
 
@@ -151,6 +152,7 @@ def train_and_evaluate_source_model(
             y_test,
             f"{train_source} CNN-only model on {test_source} test",
             args.batch_size,
+            DECISION_THRESHOLD,
         )
         evaluations[test_source] = result
         summary_rows.append(pipeline.evaluation_summary_row(train_source, test_source, result))
@@ -198,8 +200,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--val-size", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--split-protocol",
+        choices=sorted(pipeline.prep.SPLIT_PROTOCOLS),
+        default=pipeline.prep.DEFAULT_SPLIT_PROTOCOL,
+        help="How to split each loaded dataset.",
+    )
     parser.add_argument("--sample-size", type=int, default=None, help="Optional quick-run sample size for Kaggle and CSIC.")
     parser.add_argument("--obfu-sample-size", type=int, default=None, help="Optional quick-run sample size for the obfuscation dataset.")
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=["all", "kaggle", "csic", "obfu_http"],
+        default=["all"],
+        help="Datasets to load, split, and evaluate. Use 'kaggle' for a Kaggle-only run.",
+    )
     parser.add_argument(
         "--train-sources",
         nargs="+",

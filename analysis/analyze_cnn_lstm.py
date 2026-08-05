@@ -21,7 +21,9 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 
 DEFAULT_ARTIFACT_DIR = str(
-    Path(__file__).resolve().parent.parent / "cnn_lstm" / "artifacts"
+    Path(__file__).resolve().parent.parent
+    / "cnn_lstm"
+    / "artifacts_cnn_lstm_by_dataset"
 )
 DEFAULT_MAX_LEN = 768
 DEFAULT_SOURCE = "obfu_http"

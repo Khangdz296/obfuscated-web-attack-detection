@@ -58,7 +58,7 @@ from preprocessing import preprocess_data as prep
 KAGGLE_PATH = prep.KAGGLE_PATH
 CSIC_PATH = prep.CSIC_PATH
 OBFUSCATION_PATH = prep.OBFU_PATH
-OUTPUT_DIR = str(MODEL_DIR / "artifacts")
+OUTPUT_DIR = str(MODEL_DIR / "artifacts_cnn_lstm_by_dataset")
 MAX_LEN = 768
 EMBEDDING_DIM = 64
 SEED = 42
@@ -70,6 +70,15 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
+
+
+def portable_artifact_path(path: Path) -> str:
+    """Prefer project-relative POSIX paths so artifacts remain portable."""
+    resolved_path = path.resolve()
+    try:
+        return resolved_path.relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        return str(resolved_path)
 
 
 # Legacy helper kept for cnn_only/cnn_bilstm/sequence_pool scripts that still
@@ -413,7 +422,6 @@ def train_and_evaluate_source_model(
     last_model_path = source_dir / "last_hybrid_cnn_lstm.keras"
     tokenizer_path = source_dir / "tokenizer.pkl"
     history_path = source_dir / "training_history.csv"
-    config_path = source_dir / "preprocessing_config.json"
     callbacks = [
         EarlyStopping(
             monitor="val_loss",
@@ -517,9 +525,6 @@ def train_and_evaluate_source_model(
             for split_name, split_df in dataset_splits[train_source].items()
         },
     }
-    with config_path.open("w", encoding="utf-8") as file:
-        json.dump(preprocessing_config, file, ensure_ascii=False, indent=2)
-
     model_metadata = {
         "train_source": train_source,
         "preprocessing": preprocessing_config,
@@ -549,11 +554,10 @@ def train_and_evaluate_source_model(
             "decision_threshold": selected_threshold,
             "threshold_strategy": threshold_strategy,
             "artifacts": {
-                "best_model": str(best_model_path),
-                "last_model": str(last_model_path),
-                "tokenizer": str(tokenizer_path),
-                "training_history": str(history_path),
-                "preprocessing_config": str(config_path),
+                "best_model": portable_artifact_path(best_model_path),
+                "last_model": portable_artifact_path(last_model_path),
+                "tokenizer": portable_artifact_path(tokenizer_path),
+                "training_history": portable_artifact_path(history_path),
             },
         },
         "training_history": {
@@ -670,13 +674,15 @@ def main() -> None:
         "trained_sources": train_sources,
         "models": all_model_results,
         "artifacts": {
-            "processed_data": str(output_dir / "processed_data_by_dataset"),
-            "models": str(output_dir / "by_dataset"),
-            "cross_eval_results": str(output_dir / "cross_eval_results.csv"),
-            "cross_eval_accuracy_matrix": str(output_dir / "cross_eval_accuracy_matrix.csv"),
+            "processed_data": portable_artifact_path(output_dir / "processed_data_by_dataset"),
+            "models": portable_artifact_path(output_dir / "by_dataset"),
+            "cross_eval_results": portable_artifact_path(output_dir / "cross_eval_results.csv"),
+            "cross_eval_accuracy_matrix": portable_artifact_path(
+                output_dir / "cross_eval_accuracy_matrix.csv"
+            ),
         },
     }
-    with (output_dir / "cross_eval_results.json").open("w", encoding="utf-8") as file:
+    with (output_dir / "experiment_results.json").open("w", encoding="utf-8") as file:
         json.dump(experiment_results, file, ensure_ascii=False, indent=2)
 
     print(f"\nSaved by-dataset artifacts to: {(output_dir / 'by_dataset').resolve()}")

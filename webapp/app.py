@@ -10,7 +10,6 @@ Then open:
 
 import json
 import pickle
-import re
 import sys
 from functools import lru_cache
 from importlib.util import find_spec
@@ -21,23 +20,28 @@ from flask import Flask, jsonify, render_template, request
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-ARTIFACTS_DIR = PROJECT_ROOT / "cnn_lstm" / "artifacts"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from preprocessing.preprocess_data import preprocess_inference_input
+
+ARTIFACTS_DIR = (
+    PROJECT_ROOT
+    / "cnn_lstm"
+    / "artifacts_cnn_lstm_by_dataset"
+    / "by_dataset"
+    / "obfu_http"
+)
 MODEL_PATH = ARTIFACTS_DIR / "best_hybrid_cnn_lstm.keras"
 TOKENIZER_PATH = ARTIFACTS_DIR / "tokenizer.pkl"
 METADATA_PATH = ARTIFACTS_DIR / "metadata_and_results.json"
 DEFAULT_MAX_LEN = 1024
 DEFAULT_THRESHOLD = 0.5
+MAX_INPUT_CHARS = 100_000
 HOST = "127.0.0.1"
 PORT = 8000
 
 app = Flask(__name__)
-
-
-def normalize_payload(value: object) -> str:
-    """Match CNN_LSTM.py preprocessing: preserve evidence, normalize whitespace only."""
-    if not isinstance(value, str):
-        return ""
-    return re.sub(r"\s+", " ", value).strip()
 
 
 def load_metadata() -> dict:
@@ -98,12 +102,15 @@ def load_inference_assets():
 
 
 def predict_payload(payload: str, threshold: float = DEFAULT_THRESHOLD) -> dict:
-    cleaned = normalize_payload(payload)
-    if not cleaned:
-        raise ValueError("Payload is empty after whitespace normalization.")
+    if not isinstance(payload, str):
+        raise ValueError("Input must be a string.")
+    if len(payload) > MAX_INPUT_CHARS:
+        raise ValueError(f"Input exceeds the {MAX_INPUT_CHARS:,}-character limit.")
+
+    model_input, input_kind = preprocess_inference_input(payload)
 
     model, tokenizer, pad_sequences, max_len = load_inference_assets()
-    sequence = tokenizer.texts_to_sequences([cleaned])
+    sequence = tokenizer.texts_to_sequences([model_input])
     vector = pad_sequences(sequence, maxlen=max_len, padding="post", truncating="post")
     probability = float(model.predict(vector, verbose=0).flatten()[0])
     label = 1 if probability >= threshold else 0
@@ -114,10 +121,13 @@ def predict_payload(payload: str, threshold: float = DEFAULT_THRESHOLD) -> dict:
         "attack_probability": probability,
         "normal_probability": 1.0 - probability,
         "threshold": threshold,
-        "normalized_payload": cleaned,
-        "input_length": len(cleaned),
+        "normalized_payload": model_input,
+        "input_kind": input_kind,
+        "original_input_length": len(payload),
+        "input_length": len(model_input),
+        "token_count": len(sequence[0]),
         "max_len": max_len,
-        "truncated": len(cleaned) > max_len,
+        "truncated": len(sequence[0]) > max_len,
     }
 
 

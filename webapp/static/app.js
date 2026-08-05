@@ -6,6 +6,7 @@ const resultCard = document.querySelector("#result-card");
 const attackProb = document.querySelector("#attack-prob");
 const normalProb = document.querySelector("#normal-prob");
 const inputLength = document.querySelector("#input-length");
+const inputKind = document.querySelector("#input-kind");
 const normalizedPayload = document.querySelector("#normalized-payload");
 const errorMessage = document.querySelector("#error-message");
 
@@ -25,6 +26,16 @@ function showError(message) {
   resultCard.querySelector(".result-main").textContent = "Backend trả về lỗi";
 }
 
+function formatInputKind(value) {
+  const labels = {
+    unified_http_envelope: "HTTP envelope",
+    raw_http_request: "Raw HTTP request",
+    url: "URL / path",
+    payload: "Payload thuần",
+  };
+  return labels[value] || value || "-";
+}
+
 function showResult(result) {
   const isAttack = result.label === 1;
   errorMessage.textContent = "";
@@ -36,6 +47,7 @@ function showResult(result) {
   attackProb.textContent = formatPercent(result.attack_probability);
   normalProb.textContent = formatPercent(result.normal_probability);
   inputLength.textContent = `${result.input_length}${result.truncated ? ` / truncated to ${result.max_len}` : ""}`;
+  inputKind.textContent = formatInputKind(result.input_kind);
   normalizedPayload.textContent = result.normalized_payload || "-";
 }
 
