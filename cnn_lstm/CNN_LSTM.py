@@ -156,25 +156,40 @@ def vectorize(tokenizer: Tokenizer, payloads: pd.Series, max_len: int) -> np.nda
     )
 
 
-def build_model(vocab_size: int, max_len: int, embedding_dim: int) -> Sequential:
+def build_model(
+    vocab_size: int,
+    max_len: int,
+    embedding_dim: int,
+    cnn_filters: int = 128,
+    lstm_units: int = 128,
+    dense_units: int = 64,
+    dropout: float = 0.3,
+    learning_rate: float = 1e-3,
+) -> Sequential:
+    """Build the sequential CNN-LSTM model.
+
+    The optional arguments keep the original architecture as the default while
+    allowing the notebook to tune model capacity, regularisation and learning
+    rate without duplicating the topology.
+    """
     model = Sequential(name="Hybrid_1D_CNN_LSTM_Sequence_Pooling_Web_Attack_Detector")
     model.add(Input(shape=(max_len,), name="payload_tokens"))
     model.add(Embedding(input_dim=vocab_size, output_dim=embedding_dim, name="char_embedding"))
 
-    model.add(Conv1D(filters=128, kernel_size=3, padding="same", activation="relu", name="conv_k3"))
+    model.add(Conv1D(filters=cnn_filters, kernel_size=3, padding="same", activation="relu", name="conv_k3"))
     model.add(MaxPooling1D(pool_size=4, name="pool_1"))
 
-    model.add(Conv1D(filters=128, kernel_size=5, padding="same", activation="relu", name="conv_k5"))
+    model.add(Conv1D(filters=cnn_filters, kernel_size=5, padding="same", activation="relu", name="conv_k5"))
     model.add(MaxPooling1D(pool_size=4, name="pool_2"))
 
-    model.add(LSTM(128, return_sequences=True, name="lstm_context_sequence"))
+    model.add(LSTM(lstm_units, return_sequences=True, name="lstm_context_sequence"))
     model.add(GlobalMaxPooling1D(name="lstm_global_max_pool"))
-    model.add(Dense(64, activation="relu", name="dense_classifier"))
-    model.add(Dropout(0.3, name="dropout"))
+    model.add(Dense(dense_units, activation="relu", name="dense_classifier"))
+    model.add(Dropout(dropout, name="dropout"))
     model.add(Dense(1, activation="sigmoid", name="attack_probability"))
 
     model.compile(
-        optimizer=Adam(learning_rate=1e-3),
+        optimizer=Adam(learning_rate=learning_rate),
         loss="binary_crossentropy",
         metrics=[
             "accuracy",
