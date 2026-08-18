@@ -28,11 +28,11 @@ from preprocessing.preprocess_data import preprocess_inference_input
 ARTIFACTS_DIR = (
     PROJECT_ROOT
     / "cnn_lstm"
-    / "artifacts_cnn_lstm_by_dataset"
-    / "by_dataset"
+    / "artifacts_cnn_lstm_tuning"
     / "obfu_http"
+    / "final"
 )
-MODEL_PATH = ARTIFACTS_DIR / "best_hybrid_cnn_lstm.keras"
+MODEL_PATH = ARTIFACTS_DIR / "best_tuned_hybrid_cnn_lstm.keras"
 TOKENIZER_PATH = ARTIFACTS_DIR / "tokenizer.pkl"
 METADATA_PATH = ARTIFACTS_DIR / "metadata_and_results.json"
 DEFAULT_MAX_LEN = 1024
@@ -97,7 +97,22 @@ def load_inference_assets():
 
     model = tf.keras.models.load_model(MODEL_PATH, compile=False)
     metadata = load_metadata()
-    max_len = int(metadata.get("model", {}).get("max_len", DEFAULT_MAX_LEN))
+    model_max_len = model.input_shape[1]
+    if model_max_len is None:
+        model_max_len = DEFAULT_MAX_LEN
+    model_max_len = int(model_max_len)
+
+    metadata_max_len = metadata.get("model", {}).get(
+        "max_len",
+        metadata.get("max_len"),
+    )
+    if metadata_max_len is not None and int(metadata_max_len) != model_max_len:
+        raise ValueError(
+            "MAX_LEN in metadata does not match the model input shape: "
+            f"metadata={metadata_max_len}, model={model_max_len}."
+        )
+
+    max_len = model_max_len
     return model, tokenizer, pad_sequences, max_len
 
 
